@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>Morse Reader (Robust, ROI Square)</title>
+  <title>Morse Reader (Robust + Scramble)</title>
   <style>
     html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#eaeaea;}
     .wrap{position:relative;width:100vw;height:100vh;}
@@ -58,14 +58,20 @@
 </div>
 
 <script>
-/* ===== ROI (CUADRADO y más pequeño) =====
-   sidePct = porcentaje del lado respecto al lado menor de la pantalla
+/* ===== ROI (ajústalo a dónde está tu beacon en el vídeo) =====
+   Por defecto: arriba-derecha
 */
 const ROI = {
-  sidePct: 0.18,       // <-- cambia esto (0.12–0.25 típico)
+  wPct: 0.42,
+  hPct: 0.25,
   xCenterPct: 0.80,
   yCenterPct: 0.20
 };
+
+// Scramble
+const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789?/#@$%&*+-";
+const SCRAMBLE_HOLD_MS = 260;  // duración del glitch por letra
+const SCRAMBLE_STEP_MS = 35;
 
 // Morse map
 const MORSE_TO_CHAR = {
@@ -104,20 +110,22 @@ addEventListener('resize', resize);
 resize();
 
 function roiRect(){
-  const side = Math.floor(Math.min(ui.width, ui.height) * ROI.sidePct);
-  const x = Math.floor(ui.width * ROI.xCenterPct - side/2);
-  const y = Math.floor(ui.height * ROI.yCenterPct - side/2);
-  return { x:Math.max(0,x), y:Math.max(0,y), w:side, h:side };
+  const w = Math.floor(ui.width * ROI.wPct);
+  const h = Math.floor(ui.height * ROI.hPct);
+  const x = Math.floor(ui.width * ROI.xCenterPct - w/2);
+  const y = Math.floor(ui.height * ROI.yCenterPct - h/2);
+  return { x:Math.max(0,x), y:Math.max(0,y), w, h };
 }
 
 // Un ROI “anillo” alrededor para medir fondo (evita autoexposición)
 function bgRect(){
   const r = roiRect();
-  const pad = Math.floor(r.w * 0.7); // parecido a tu versión original, pero cuadrado
-  const x = Math.max(0, r.x - pad);
-  const y = Math.max(0, r.y - pad);
-  const w = Math.min(ui.width - x, r.w + 2*pad);
-  const h = Math.min(ui.height - y, r.h + 2*pad);
+  const padX = Math.floor(r.w * 0.25);
+  const padY = Math.floor(r.h * 0.25);
+  const x = Math.max(0, r.x - padX);
+  const y = Math.max(0, r.y - padY);
+  const w = Math.min(ui.width - x, r.w + 2*padX);
+  const h = Math.min(ui.height - y, r.h + 2*padY);
   return { x, y, w, h };
 }
 
@@ -152,7 +160,10 @@ function avgLuma(rect, skipInnerRect=null){
   const d = img.data;
   let sum=0, n=0;
 
+  // muestreo (rápido)
   const step = 24;
+
+  // si queremos excluir el ROI central del fondo, lo hacemos por coordenadas
   const ex = skipInnerRect;
 
   for(let i=0;i<d.length;i+=step){
@@ -173,14 +184,46 @@ function avgLuma(rect, skipInnerRect=null){
 }
 
 /* ===== Decoder con umbral adaptativo + histéresis ===== */
-let baseline = 0;
-let sigma = 0;
+let baseline = 0;         // baseline del Δ
+let sigma = 0;            // variabilidad del Δ
 let on = false;
 let lastChange = performance.now();
 
 let currentSymbol = "";
 let seqVisible = "";
-let textOut = "";
+let stableText = "";
+let pending = [];
+let scrambling = false;
+
+function randChar(){
+  return SCRAMBLE_CHARS[Math.floor(Math.random()*SCRAMBLE_CHARS.length)];
+}
+
+function enqueueChars(s){
+  for(const ch of s) pending.push(ch);
+  if(!scrambling) runScramble();
+}
+
+async function runScramble(){
+  scrambling = true;
+  while(pending.length){
+    const ch = pending.shift();
+    if (ch === " "){
+      stableText += " ";
+      elOut.textContent = stableText || "(mensaje)";
+      continue;
+    }
+    // glitch
+    const t0 = performance.now();
+    while(performance.now() - t0 < SCRAMBLE_HOLD_MS){
+      elOut.textContent = stableText + randChar();
+      await new Promise(r=>setTimeout(r, SCRAMBLE_STEP_MS));
+    }
+    stableText += ch;
+    elOut.textContent = stableText || "(mensaje)";
+  }
+  scrambling = false;
+}
 
 function addSymbol(sym){
   currentSymbol += sym;
@@ -191,15 +234,13 @@ function addSymbol(sym){
 function commitLetter(){
   if(!currentSymbol) return;
   const ch = MORSE_TO_CHAR[currentSymbol] || "�";
-  textOut += ch;
-  elOut.textContent = textOut || "(mensaje)";
+  enqueueChars(ch);
   currentSymbol = "";
 }
 
 function commitWord(){
   commitLetter();
-  textOut += " ";
-  elOut.textContent = textOut || "(mensaje)";
+  enqueueChars(" ");
 }
 
 function resetAll(){
@@ -209,7 +250,9 @@ function resetAll(){
   currentSymbol = "";
   seqVisible = "";
   elSeq.textContent = "—";
-  textOut = "";
+  stableText = "";
+  pending = [];
+  scrambling = false;
   elOut.textContent = "(mensaje)";
 }
 
@@ -252,9 +295,10 @@ function loop(){
   const b = bgRect();
 
   const Lroi = avgLuma(r, null);
-  const Lbg  = avgLuma(b, r);
-  const delta = Lroi - Lbg;
+  const Lbg  = avgLuma(b, r);      // fondo excluyendo el ROI central
+  const delta = Lroi - Lbg;        // señal útil
 
+  // baseline y sigma del delta (adaptativo)
   baseline = baseline ? (baseline*0.985 + delta*0.015) : delta;
 
   const dev = Math.abs(delta - baseline);
@@ -263,6 +307,7 @@ function loop(){
   const dotMs = Math.max(120, Number(dotInput.value) || 250);
   const sens  = Math.max(0.8, Number(sensInput.value) || 1.8);
 
+  // umbrales con histéresis
   const thOn  = baseline + sigma * sens;
   const thOff = baseline + sigma * (sens * 0.55);
 
@@ -275,7 +320,7 @@ function loop(){
 
   updateState(nextOn, dotMs);
 
-  // cierres automáticos si se queda OFF (igual que tu original)
+  // cierres automáticos si se queda OFF
   const now = performance.now();
   if(!on){
     const offDur = now - lastChange;
