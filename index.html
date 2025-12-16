@@ -3,28 +3,58 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>Morse Reader (Square ROI + Letter-by-letter Scramble)</title>
+  <title>Morse Reader (Small ROI + Live Scramble)</title>
+
   <style>
-    html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#eaeaea;}
+    html,body{
+      margin:0;height:100%;background:#000;overflow:hidden;
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      color:#eaeaea;
+    }
     .wrap{position:relative;width:100vw;height:100vh;}
     video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
     canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
 
-    .start{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);text-align:center;padding:24px;}
-    .start button{background:#1f1f1f;border:1px solid #3a3a3a;color:#eaeaea;border-radius:14px;padding:12px 16px;font-size:16px;cursor:pointer;}
+    .start{
+      position:absolute;inset:0;
+      display:flex;align-items:center;justify-content:center;
+      background:rgba(0,0,0,.55);
+      text-align:center;padding:24px;
+    }
+    .start button{
+      background:#1f1f1f;border:1px solid #3a3a3a;
+      color:#eaeaea;border-radius:14px;
+      padding:12px 16px;font-size:16px;cursor:pointer;
+    }
     .start p{margin:10px 0 0;opacity:.8;font-size:13px;line-height:1.35}
 
     .hud{
       position:absolute;left:12px;right:12px;bottom:12px;
-      background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.15);
-      border-radius:16px;padding:10px 12px;backdrop-filter:blur(6px);
+      background:rgba(0,0,0,.55);
+      border:1px solid rgba(255,255,255,.15);
+      border-radius:16px;padding:10px 12px;
+      backdrop-filter:blur(6px);
     }
     .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
-    .pill{padding:3px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.35);font-size:13px;opacity:.9}
+    .pill{
+      padding:3px 10px;border-radius:999px;
+      border:1px solid rgba(255,255,255,.15);
+      background:rgba(0,0,0,.35);
+      font-size:13px;opacity:.9
+    }
     .mono{font-family:ui-monospace,Menlo,Consolas,monospace;}
-    .big{font-size:24px;white-space:pre-wrap;word-break:break-word;line-height:1.25}
-    button.small{background:#222;border:1px solid #333;color:#eaeaea;border-radius:12px;padding:8px 10px;font-size:14px;cursor:pointer;}
-    input.small{width:72px;background:#111;border:1px solid #333;color:#eaeaea;border-radius:12px;padding:8px 10px;font-size:14px;}
+    .big{
+      font-size:24px;white-space:pre-wrap;
+      word-break:break-word;line-height:1.25
+    }
+    button.small{
+      background:#222;border:1px solid #333;color:#eaeaea;
+      border-radius:12px;padding:8px 10px;font-size:14px;cursor:pointer;
+    }
+    input.small{
+      width:72px;background:#111;border:1px solid #333;color:#eaeaea;
+      border-radius:12px;padding:8px 10px;font-size:14px;
+    }
     .sub{opacity:.75;font-size:13px}
   </style>
 </head>
@@ -38,7 +68,7 @@
     <div>
       <button id="btnStart">Toca para iniciar la cámara</button>
       <p>
-        Mete el beacon dentro del marco (cuadrado).<br>
+        Mete el beacon dentro del marco.<br>
         Emisor recomendado: unidad 250 ms.
       </p>
     </div>
@@ -52,46 +82,36 @@
       <span class="pill mono">Sens: <input id="sens" class="small" value="1.8"></span>
       <button class="small" id="btnClear">Borrar</button>
     </div>
-    <div style="margin-top:8px" class="mono sub">Secuencia: <span id="seq">—</span></div>
+    <div style="margin-top:8px" class="mono sub">
+      Secuencia: <span id="seq">—</span>
+    </div>
     <div style="margin-top:8px" class="mono big" id="out">(mensaje)</div>
   </div>
 </div>
 
 <script>
-/* =========================
-   ROI CUADRADO (pequeño)
-   Ajusta sizePct y la posición.
-   ========================= */
+/* ===== ROI pequeño ===== */
 const ROI = {
-  sizePct: 0.18,     // <- más pequeño (0.12–0.25 suele ir bien)
-  xCenterPct: 0.82,  // derecha
-  yCenterPct: 0.22   // arriba
+  wPct: 0.22,
+  hPct: 0.14,
+  xCenterPct: 0.80,
+  yCenterPct: 0.20
 };
 
-/* =========================
-   SCRAMBLE (forzado visible)
-   ========================= */
+/* ===== Scramble ===== */
 const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789?/#@$%&*+-";
-const SCRAMBLE_DURATION_MS = 420; // <- más largo para que SE VEA
-const SCRAMBLE_FPS = 30;          // actualizaciones por segundo aprox
+const SCRAMBLE_HOLD_MS = 2000;
+const SCRAMBLE_STEP_MS = 35;
 
-function randChar(){
-  return SCRAMBLE_CHARS[Math.floor(Math.random()*SCRAMBLE_CHARS.length)];
-}
-
-/* =========================
-   MORSE MAP
-   ========================= */
+/* ===== Morse ===== */
 const MORSE_TO_CHAR = {
   ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F","--.":"G","....":"H","..":"I",
   ".---":"J","-.-":"K",".-..":"L","--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
   "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X","-.--":"Y","--..":"Z",
-  "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
+  "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",".....":"5","-....":"6",
+  "--...":"7","---..":"8","----.":"9"
 };
 
-/* =========================
-   ELEMENTOS
-   ========================= */
 const video = document.getElementById('video');
 const ui = document.getElementById('ui');
 const ctx = ui.getContext('2d');
@@ -114,28 +134,30 @@ const fctx = frame.getContext('2d', { willReadFrequently:true });
 let stream = null;
 
 function resize(){
-  ui.width = innerWidth; ui.height = innerHeight;
-  frame.width = innerWidth; frame.height = innerHeight;
+  ui.width = innerWidth;
+  ui.height = innerHeight;
+  frame.width = innerWidth;
+  frame.height = innerHeight;
 }
 addEventListener('resize', resize);
 resize();
 
-/* ROI cuadrado */
 function roiRect(){
-  const size = Math.floor(Math.min(ui.width, ui.height) * ROI.sizePct);
-  const x = Math.floor(ui.width * ROI.xCenterPct - size/2);
-  const y = Math.floor(ui.height * ROI.yCenterPct - size/2);
-  return { x:Math.max(0,x), y:Math.max(0,y), w:size, h:size };
+  const w = Math.floor(ui.width * ROI.wPct);
+  const h = Math.floor(ui.height * ROI.hPct);
+  const x = Math.floor(ui.width * ROI.xCenterPct - w/2);
+  const y = Math.floor(ui.height * ROI.yCenterPct - h/2);
+  return { x:Math.max(0,x), y:Math.max(0,y), w, h };
 }
 
-/* Fondo alrededor (anillo) */
 function bgRect(){
   const r = roiRect();
-  const pad = Math.floor(r.w * 0.55);
-  const x = Math.max(0, r.x - pad);
-  const y = Math.max(0, r.y - pad);
-  const w = Math.min(ui.width - x, r.w + 2*pad);
-  const h = Math.min(ui.height - y, r.h + 2*pad);
+  const padX = Math.floor(r.w * 0.25);
+  const padY = Math.floor(r.h * 0.25);
+  const x = Math.max(0, r.x - padX);
+  const y = Math.max(0, r.y - padY);
+  const w = Math.min(ui.width - x, r.w + 2*padX);
+  const h = Math.min(ui.height - y, r.h + 2*padY);
   return { x, y, w, h };
 }
 
@@ -145,12 +167,6 @@ function drawUI(){
   ctx.lineWidth = 3;
   ctx.strokeStyle = "rgba(0,255,120,0.92)";
   ctx.strokeRect(x,y,w,h);
-  const c=18;
-  ctx.lineWidth=5;
-  ctx.beginPath(); ctx.moveTo(x,y+c); ctx.lineTo(x,y); ctx.lineTo(x+c,y); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(x+w-c,y); ctx.lineTo(x+w,y); ctx.lineTo(x+w,y+c); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(x,y+h-c); ctx.lineTo(x,y+h); ctx.lineTo(x+c,y+h); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(x+w-c,y+h); ctx.lineTo(x+w,y+h); ctx.lineTo(x+w,y+h-c); ctx.stroke();
 }
 
 function drawCover(){
@@ -165,206 +181,156 @@ function drawCover(){
   return true;
 }
 
-function avgLuma(rect, skipInnerRect=null){
+function avgLuma(rect, skip=null){
   const img = fctx.getImageData(rect.x, rect.y, rect.w, rect.h);
   const d = img.data;
   let sum=0, n=0;
   const step = 24;
-  const ex = skipInnerRect;
 
   for(let i=0;i<d.length;i+=step){
-    const px = ((i/4) % rect.w) | 0;
-    const py = ((i/4 / rect.w)) | 0;
+    const px = ((i/4) % rect.w)|0;
+    const py = ((i/4 / rect.w))|0;
+    const sx = rect.x + px;
+    const sy = rect.y + py;
 
-    if (ex){
-      const sx = rect.x + px;
-      const sy = rect.y + py;
-      if (sx >= ex.x && sx < ex.x+ex.w && sy >= ex.y && sy < ex.y+ex.h) continue;
-    }
+    if(skip &&
+       sx>=skip.x && sx<skip.x+skip.w &&
+       sy>=skip.y && sy<skip.y+skip.h) continue;
 
     const r=d[i], g=d[i+1], b=d[i+2];
-    const lum = 0.2126*r + 0.7152*g + 0.0722*b;
-    sum += lum; n++;
+    sum += 0.2126*r + 0.7152*g + 0.0722*b;
+    n++;
   }
   return n ? sum/n : 0;
 }
 
-/* =========================
-   SALIDA: letra a letra + scramble EN CADENA
-   ========================= */
-let stableText = "";
-let outputChain = Promise.resolve(); // <- clave: encadena letras, nunca “de golpe”
-
-function renderStable(){
-  elOut.textContent = stableText || "(mensaje)";
-}
-
-function animateChar(ch){
-  return new Promise(resolve=>{
-    if (ch === " "){
-      stableText += " ";
-      renderStable();
-      resolve();
-      return;
-    }
-
-    const start = performance.now();
-    let lastFrame = 0;
-    const minFrameInterval = 1000 / SCRAMBLE_FPS;
-
-    function frameFn(t){
-      if (t - lastFrame >= minFrameInterval){
-        elOut.textContent = stableText + randChar();
-        lastFrame = t;
-      }
-      if (t - start >= SCRAMBLE_DURATION_MS){
-        stableText += ch;
-        renderStable();
-        resolve();
-        return;
-      }
-      requestAnimationFrame(frameFn);
-    }
-    requestAnimationFrame(frameFn);
-  });
-}
-
-function pushOut(ch){
-  // <- SIEMPRE letra a letra y con scramble visible
-  outputChain = outputChain.then(()=>animateChar(ch));
-}
-
-function pushWordGap(){
-  pushOut(" ");
-}
-
-function resetOutput(){
-  stableText = "";
-  outputChain = Promise.resolve();
-  elOut.textContent = "(mensaje)";
-}
-
-/* =========================
-   DECODER MORSE
-   ========================= */
-let baseline = 0;
-let sigma = 0;
-let on = false;
+/* ===== Decoder ===== */
+let baseline=0, sigma=0, on=false;
 let lastChange = performance.now();
+let currentSymbol="", seqVisible="";
+let stableText="", pending=[];
+let scrambling=false;
+let lastCommitAt=0;
 
-let currentSymbol = "";
-let seqVisible = "";
+function randChar(){
+  return SCRAMBLE_CHARS[Math.floor(Math.random()*SCRAMBLE_CHARS.length)];
+}
 
-function addSymbol(sym){
-  currentSymbol += sym;
-  seqVisible += sym;
+function enqueueChars(s){
+  for(const c of s) pending.push(c);
+  if(!scrambling) runScramble();
+}
+
+async function runScramble(){
+  scrambling = true;
+  while(pending.length){
+    const ch = pending.shift();
+    if(ch===" "){
+      stableText += " ";
+      elOut.textContent = stableText || "(mensaje)";
+      continue;
+    }
+    const t0 = performance.now();
+    while(performance.now() - t0 < SCRAMBLE_HOLD_MS){
+      elOut.textContent = stableText + randChar();
+      await new Promise(r=>setTimeout(r, SCRAMBLE_STEP_MS));
+    }
+    stableText += ch;
+    elOut.textContent = stableText || "(mensaje)";
+  }
+  scrambling = false;
+}
+
+function addSymbol(s){
+  currentSymbol += s;
+  seqVisible += s;
   elSeq.textContent = seqVisible || "—";
 }
 
 function commitLetter(){
   if(!currentSymbol) return;
-  const ch = MORSE_TO_CHAR[currentSymbol] || "�";
-  pushOut(ch);
+  const now = performance.now();
+  if(now - lastCommitAt < 120) return;
+  lastCommitAt = now;
+  enqueueChars(MORSE_TO_CHAR[currentSymbol] || "�");
   currentSymbol = "";
 }
 
 function commitWord(){
+  const now = performance.now();
+  if(now - lastCommitAt < 120) return;
+  lastCommitAt = now;
   commitLetter();
-  pushWordGap();
+  enqueueChars(" ");
 }
 
 function resetAll(){
-  baseline = 0; sigma = 0;
-  on = false; lastChange = performance.now();
-  currentSymbol = ""; seqVisible = "";
-  elSeq.textContent = "—";
-  resetOutput();
+  baseline=0; sigma=0; on=false;
+  lastChange=performance.now();
+  currentSymbol=""; seqVisible="";
+  stableText=""; pending=[];
+  scrambling=false; lastCommitAt=0;
+  elSeq.textContent="—";
+  elOut.textContent="(mensaje)";
 }
 
 function updateState(nextOn, dotMs){
   const now = performance.now();
-  if(nextOn === on) return;
-
-  const dt = now - lastChange;
-
-  const DOT_MAX = dotMs * 2.0;
-  const DASH_MIN = dotMs * 2.0;
-  const LETTER_GAP_MIN = dotMs * 2.2;
-  const WORD_GAP_MIN   = dotMs * 5.5;
+  if(nextOn===on) return;
+  const dt = now-lastChange;
 
   if(on){
-    // ON -> OFF: pulso
-    if(dt <= DOT_MAX) addSymbol(".");
-    else if(dt >= DASH_MIN) addSymbol("-");
-    else addSymbol(".");
-  } else {
-    // OFF -> ON: silencio
-    if(dt >= WORD_GAP_MIN){
-      commitWord(); seqVisible += " / "; elSeq.textContent = seqVisible || "—";
-    } else if(dt >= LETTER_GAP_MIN){
-      commitLetter(); seqVisible += " "; elSeq.textContent = seqVisible || "—";
-    }
+    if(dt<=dotMs*2) addSymbol(".");
+    else addSymbol("-");
+  }else{
+    if(dt>=dotMs*5.5) commitWord();
+    else if(dt>=dotMs*2.2) commitLetter();
   }
-
-  lastChange = now;
-  on = nextOn;
+  lastChange=now;
+  on=nextOn;
 }
 
 function loop(){
   requestAnimationFrame(loop);
   drawUI();
-  if(!stream) return;
-  if(!drawCover()) return;
+  if(!stream || !drawCover()) return;
 
-  const r = roiRect();
-  const b = bgRect();
+  const r=roiRect(), b=bgRect();
+  const Lroi=avgLuma(r,null);
+  const Lbg=avgLuma(b,r);
+  const delta=Lroi-Lbg;
 
-  const Lroi = avgLuma(r, null);
-  const Lbg  = avgLuma(b, r);
-  const delta = Lroi - Lbg;
+  baseline = baseline ? baseline*0.985 + delta*0.015 : delta;
+  const dev = Math.abs(delta-baseline);
+  sigma = sigma ? sigma*0.98 + dev*0.02 : dev;
 
-  baseline = baseline ? (baseline*0.985 + delta*0.015) : delta;
+  const dotMs=Math.max(120,Number(dotInput.value)||250);
+  const sens=Math.max(0.8,Number(sensInput.value)||1.8);
 
-  const dev = Math.abs(delta - baseline);
-  sigma = sigma ? (sigma*0.98 + dev*0.02) : dev;
+  const thOn = baseline + sigma*sens;
+  const thOff= baseline + sigma*(sens*0.55);
 
-  const dotMs = Math.max(120, Number(dotInput.value) || 250);
-  const sens  = Math.max(0.8, Number(sensInput.value) || 1.8);
+  let nextOn=on;
+  if(!on && delta>thOn) nextOn=true;
+  else if(on && delta<thOff) nextOn=false;
 
-  const thOn  = baseline + sigma * sens;
-  const thOff = baseline + sigma * (sens * 0.55);
+  elState.textContent = nextOn?"ON detectado":"OFF detectado";
+  elDval.textContent = `Δ: ${delta.toFixed(1)} (bg ${Lbg.toFixed(0)})`;
 
-  let nextOn = on;
-  if(!on && delta > thOn) nextOn = true;
-  else if(on && delta < thOff) nextOn = false;
-
-  elDval.textContent = `Δ: ${delta.toFixed(1)}`;
-  elState.textContent = nextOn ? "ON detectado" : "OFF detectado";
-
-  updateState(nextOn, dotMs);
-
-  // cierres automáticos si se queda OFF
-  const now = performance.now();
-  if(!on){
-    const offDur = now - lastChange;
-    const LETTER_GAP_MIN = dotMs * 2.2;
-    const WORD_GAP_MIN   = dotMs * 5.5;
-    if(offDur >= WORD_GAP_MIN) commitWord();
-    else if(offDur >= LETTER_GAP_MIN) commitLetter();
-  }
+  updateState(nextOn,dotMs);
 }
 
-btnClear.addEventListener('click', resetAll);
+btnClear.onclick = resetAll;
 
-btnStart.addEventListener('click', async ()=>{
+btnStart.onclick = async ()=>{
   stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode:{ ideal:"environment" }, width:{ideal:1280}, height:{ideal:720} },
+    video:{facingMode:{ideal:"environment"},width:{ideal:1280},height:{ideal:720}},
     audio:false
   });
   video.srcObject = stream;
   resetAll();
-  startOverlay.style.display = "none";
-});
+  startOverlay.style.display="none";
+};
 
 loop();
 </script>
