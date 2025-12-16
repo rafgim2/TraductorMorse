@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (frames final ajustado)</title>
+<title>Morse Decoder (final definitivo)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -29,11 +29,11 @@
 <script>
 (() => {
 
-  /* ===== AJUSTES VISUALES ===== */
-  const ROI = 24;        // cuadrado pequeño (CSS px)
-  const PATCH = 9;       // parche central para brillo
+  /* ===== CONFIG ===== */
+  const ROI = 24;
+  const PATCH = 9;
+  const IGNORE_LETTERS = 3; // ← preámbulo EEE
 
-  /* ===== MORSE (igual que emisor) ===== */
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
     "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
@@ -49,7 +49,6 @@
   const ctxU = ui.getContext("2d");
   const out = document.getElementById("out");
 
-  /* ===== Canvas oculto para lectura ===== */
   const cv = document.createElement("canvas");
   const ctxV = cv.getContext("2d",{willReadFrequently:true});
 
@@ -62,165 +61,107 @@
 
   /* ===== ROI arrastrable ===== */
   let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
-
   ui.addEventListener("pointerdown",e=>{
     if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI &&
        e.clientY>=roi.y&&e.clientY<=roi.y+ROI){
-      dragging=true;
-      dx=e.clientX-roi.x;
-      dy=e.clientY-roi.y;
+      dragging=true; dx=e.clientX-roi.x; dy=e.clientY-roi.y;
       ui.setPointerCapture(e.pointerId);
     }
   });
   ui.addEventListener("pointermove",e=>{
-    if(!dragging) return;
-    roi.x=e.clientX-dx;
-    roi.y=e.clientY-dy;
+    if(dragging){ roi.x=e.clientX-dx; roi.y=e.clientY-dy; }
   });
   ui.addEventListener("pointerup",()=>dragging=false);
   ui.addEventListener("pointercancel",()=>dragging=false);
 
-  /* ===== Dibujo cover (igual que video visible) ===== */
   function drawCover(){
     const W=cv.width,H=cv.height;
     const vw=v.videoWidth,vh=v.videoHeight;
     if(!vw||!vh) return false;
     const s=Math.max(W/vw,H/vh);
-    const dw=vw*s, dh=vh*s;
-    const ox=(W-dw)/2, oy=(H-dh)/2;
-    ctxV.drawImage(v, ox, oy, dw, dh);
+    ctxV.drawImage(v,(W-vw*s)/2,(H-vh*s)/2,vw*s,vh*s);
     return true;
   }
 
-  /* ===== Luminancia parche ===== */
   function readLum(){
     if(!drawCover()) return null;
-    const cx=Math.floor(roi.x+ROI/2);
-    const cy=Math.floor(roi.y+ROI/2);
-    const h=Math.floor(PATCH/2);
-    const x=Math.max(0, Math.min(cv.width-PATCH, cx-h));
-    const y=Math.max(0, Math.min(cv.height-PATCH, cy-h));
-    const data=ctxV.getImageData(x,y,PATCH,PATCH).data;
+    const cx=roi.x+ROI/2, cy=roi.y+ROI/2, h=PATCH>>1;
+    const data=ctxV.getImageData(cx-h,cy-h,PATCH,PATCH).data;
     let sum=0;
-    for(let i=0;i<data.length;i+=4){
+    for(let i=0;i<data.length;i+=4)
       sum+=0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2];
-    }
     return sum/(data.length/4);
   }
 
   /* ===== DECODER POR FRAMES ===== */
-  let offLevel=null,onLevel=null;
-  let stableOn=false;
-  let onFrames=0,offFrames=0;
-  let current="",text="";
-  let started=false;
-  let letterClosed=false;
+  let offLevel=null,onLevel=null,stableOn=false;
+  let onF=0,offF=0,current="",text="";
+  let started=false,letterClosed=false;
+  let decodedCount=0;
 
-  const dotSamples=[];
-  function pushDot(n){
-    dotSamples.push(n);
-    if(dotSamples.length>20) dotSamples.shift();
-  }
-  function dotUnit(){
-    if(dotSamples.length<5) return null;
-    const s=[...dotSamples].sort((a,b)=>a-b);
-    return s[Math.floor(s.length/2)];
-  }
+  const dots=[];
+  const dotUnit=()=>dots.length>=5?[...dots].sort((a,b)=>a-b)[dots.length>>1]:null;
 
   function flush(){
     if(!current) return;
-    text+=MORSE[current]||"�";
-    out.textContent=text;
+    decodedCount++;
+    if(decodedCount > IGNORE_LETTERS){
+      text+=MORSE[current]||"�";
+      out.textContent=text;
+    }
     current="";
   }
-  function addSpace(){
-    if(text && !text.endsWith(" ")){
-      text+=" ";
-      out.textContent=text;
+  function space(){
+    if(decodedCount>IGNORE_LETTERS && !text.endsWith(" ")){
+      text+=" "; out.textContent=text;
     }
   }
 
-  function processFrame(){
-    const lum=readLum();
-    if(lum==null) return;
-
+  function loop(){
+    const lum=readLum(); if(lum==null) return;
     if(offLevel==null){ offLevel=onLevel=lum; }
 
     const thr=(offLevel+onLevel)/2;
-    const hyster=8;
-    const rawOn = stableOn ? (lum>thr-hyster) : (lum>thr+hyster);
+    const on = stableOn ? lum>thr-8 : lum>thr+8;
 
-    const a=0.06;
-    if(rawOn) onLevel+=a*(lum-onLevel);
-    else offLevel+=a*(lum-offLevel);
-    if(onLevel<offLevel+25) onLevel=offLevel+25;
+    if(on){ onF++; onLevel+=0.05*(lum-onLevel); }
+    else{ offF++; offLevel+=0.05*(lum-offLevel); }
 
-    if(rawOn){
-      onFrames++;
-      if(!stableOn){
-        const u=dotUnit();
-        if(started && u){
-          if(offFrames >= 6*u){
-            flush();
-            addSpace();
-            letterClosed = true;
-          }
-          else if(offFrames >= 1.3*u){   // ← AJUSTE CLAVE
-            flush();
-            letterClosed = true;
-          }
-        }
-        offFrames=0;
-        stableOn=true;
-      }
-    }else{
-      offFrames++;
+    if(on!==stableOn){
+      const u=dotUnit();
       if(stableOn){
-        if(!started && onFrames>=2) started=true;
-        if(onFrames>0 && onFrames<=12) pushDot(onFrames);
-        const u=dotUnit();
-        if(started && u){
-          current += (onFrames < 2*u ? "." : "-");
-          letterClosed = false;
-        }
-        onFrames=0;
-        stableOn=false;
+        if(!started && onF>=2) started=true;
+        if(onF<=12) dots.push(onF);
+        if(started&&u) current+=(onF<2*u?".":"-");
+        onF=0; letterClosed=false;
+      }else if(started&&u){
+        if(offF>=6*u){ flush(); space(); letterClosed=true; }
+        else if(offF>=1.3*u){ flush(); letterClosed=true; }
+        offF=0;
       }
+      stableOn=on;
     }
 
     const u=dotUnit();
-    if(started && !stableOn && u){
-      if(current && offFrames >= 1.8*u && !letterClosed){
-        flush();
-        letterClosed = true;
-      }
-      if(offFrames >= 6*u){
-        addSpace();
-      }
+    if(started&&!stableOn&&u){
+      if(current&&offF>=1.8*u&&!letterClosed){ flush(); letterClosed=true; }
+      if(offF>=6*u) space();
     }
 
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
-    ctxU.lineWidth=2;
     ctxU.strokeRect(roi.x,roi.y,ROI,ROI);
   }
 
-  function startLoop(){
+  function start(){
     if("requestVideoFrameCallback"in HTMLVideoElement.prototype){
-      const step=()=>{processFrame();v.requestVideoFrameCallback(step);};
+      const step=()=>{loop();v.requestVideoFrameCallback(step);};
       v.requestVideoFrameCallback(step);
-    }else{
-      const step=()=>{processFrame();requestAnimationFrame(step);};
-      step();
-    }
+    }else requestAnimationFrame(function step(){loop();requestAnimationFrame(step);});
   }
 
   navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
-    .then(s=>{
-      v.srcObject=s;
-      v.onloadedmetadata=()=>{v.play();startLoop();};
-    })
-    .catch(()=>out.textContent="No se pudo acceder a la cámara");
+    .then(s=>{v.srcObject=s;v.onloadedmetadata=()=>{v.play();start();};});
 
 })();
 </script>
