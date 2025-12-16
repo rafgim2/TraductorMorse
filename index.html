@@ -22,14 +22,15 @@
 <body>
 
 <video id="v" autoplay playsinline muted></video>
-<canvas id="c"></canvas>
+<canvas id="cv"></canvas> <!-- video -->
+<canvas id="ui"></canvas> <!-- overlay -->
 <div id="out"></div>
 
 <script>
 (() => {
 
-const UNIT = 250;              // EXACTO a tu emisor
-const ROI_SIZE = 32;           // ← CUADRADO REAL, PEQUEÑO
+const UNIT = 250;
+const ROI = 32; // CUADRADO REAL
 
 const MORSE = {
 ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
@@ -42,50 +43,55 @@ const MORSE = {
 };
 
 const v = document.getElementById("v");
-const c = document.getElementById("c");
-const ctx = c.getContext("2d",{willReadFrequently:true});
+const cv = document.getElementById("cv");
+const ui = document.getElementById("ui");
+const ctxV = cv.getContext("2d",{willReadFrequently:true});
+const ctxU = ui.getContext("2d");
 const out = document.getElementById("out");
 
-let roi = { x: 40, y: 40 };    // ← EN PIXELES
+let roi = { x:40, y:40 };
 let dragging=false, dx=0, dy=0;
 
 function resize(){
-  c.width  = innerWidth  * devicePixelRatio;
-  c.height = innerHeight * devicePixelRatio;
+  const w=innerWidth*devicePixelRatio;
+  const h=innerHeight*devicePixelRatio;
+  cv.width=cv.height=0;
+  cv.width=w; cv.height=h;
+  ui.width=w; ui.height=h;
 }
 addEventListener("resize", resize);
 resize();
 
-/* ===== DRAG REAL ===== */
-c.addEventListener("pointerdown", e=>{
+/* DRAG REAL */
+ui.addEventListener("pointerdown", e=>{
   const x=e.clientX*devicePixelRatio;
   const y=e.clientY*devicePixelRatio;
-  if(x>=roi.x && x<=roi.x+ROI_SIZE &&
-     y>=roi.y && y<=roi.y+ROI_SIZE){
+  if(x>=roi.x && x<=roi.x+ROI &&
+     y>=roi.y && y<=roi.y+ROI){
     dragging=true;
     dx=x-roi.x; dy=y-roi.y;
-    c.setPointerCapture(e.pointerId);
+    ui.setPointerCapture(e.pointerId);
   }
 });
-c.addEventListener("pointermove", e=>{
+ui.addEventListener("pointermove", e=>{
   if(!dragging) return;
   roi.x=e.clientX*devicePixelRatio-dx;
   roi.y=e.clientY*devicePixelRatio-dy;
 });
-c.addEventListener("pointerup", ()=>dragging=false);
-c.addEventListener("pointercancel", ()=>dragging=false);
+ui.addEventListener("pointerup", ()=>dragging=false);
+ui.addEventListener("pointercancel", ()=>dragging=false);
 
-/* ===== LUMINANCIA ===== */
+/* LUMINANCIA REAL DEL CUADRADO */
 function luminance(){
-  ctx.drawImage(v,0,0,c.width,c.height);
-  const d=ctx.getImageData(roi.x,roi.y,ROI_SIZE,ROI_SIZE).data;
+  ctxV.drawImage(v,0,0,cv.width,cv.height);
+  const d=ctxV.getImageData(roi.x,roi.y,ROI,ROI).data;
   let s=0;
   for(let i=0;i<d.length;i+=16)
     s+=0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2];
   return (s/(d.length/16))/255;
 }
 
-/* ===== DECODER ===== */
+/* DECODER */
 let base=0,smooth=0,lastOn=false,lastT=performance.now();
 let cur="", text="";
 
@@ -96,30 +102,28 @@ function flush(){
 function loop(){
   const l=luminance();
   base+=0.02*(l-base);
-  smooth+=0.25*(l-smooth);
+  smooth+=0.3*(l-smooth);
 
-  const on = lastOn ? smooth>base+0.03 : smooth>base+0.05;
+  const on = lastOn ? smooth>base+0.03 : smooth>base+0.06;
   const now=performance.now();
 
   if(on!==lastOn){
     const dt=now-lastT;
     lastT=now;
-    if(lastOn && !on)
-      cur+=dt<2*UNIT?".":"-";
+    if(lastOn && !on) cur+=dt<2*UNIT?".":"-";
     if(!lastOn && on && dt>=3*UNIT) flush();
     if(!lastOn && on && dt>=7*UNIT) text+=" ";
     lastOn=on;
   }
 
-  ctx.clearRect(0,0,c.width,c.height);
-  ctx.strokeStyle="rgba(0,255,120,.9)";
-  ctx.lineWidth=3*devicePixelRatio;
-  ctx.strokeRect(roi.x,roi.y,ROI_SIZE,ROI_SIZE);
+  ctxU.clearRect(0,0,ui.width,ui.height);
+  ctxU.strokeStyle="rgba(0,255,120,.9)";
+  ctxU.lineWidth=3*devicePixelRatio;
+  ctxU.strokeRect(roi.x,roi.y,ROI,ROI);
 
   requestAnimationFrame(loop);
 }
 
-/* ===== START ===== */
 navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}})
 .then(s=>{
   v.srcObject=s;
