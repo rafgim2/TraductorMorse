@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (frames)</title>
+<title>Morse Decoder (frames final)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -28,9 +28,12 @@
 
 <script>
 (() => {
-  const ROI = 24;      // cuadrado pequeño
-  const PATCH = 9;     // parche 9x9 (robusto)
 
+  /* ===== AJUSTES VISUALES ===== */
+  const ROI = 24;        // cuadrado pequeño (CSS px)
+  const PATCH = 9;       // parche central para brillo
+
+  /* ===== MORSE (igual que emisor) ===== */
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
     "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
@@ -46,7 +49,7 @@
   const ctxU = ui.getContext("2d");
   const out = document.getElementById("out");
 
-  // offscreen lectura
+  /* ===== Canvas oculto para lectura ===== */
   const cv = document.createElement("canvas");
   const ctxV = cv.getContext("2d",{willReadFrequently:true});
 
@@ -57,23 +60,27 @@
   addEventListener("resize", resize);
   resize();
 
-  // ROI arrastrable
+  /* ===== ROI arrastrable ===== */
   let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
+
   ui.addEventListener("pointerdown",e=>{
     if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI &&
        e.clientY>=roi.y&&e.clientY<=roi.y+ROI){
-      dragging=true; dx=e.clientX-roi.x; dy=e.clientY-roi.y;
+      dragging=true;
+      dx=e.clientX-roi.x;
+      dy=e.clientY-roi.y;
       ui.setPointerCapture(e.pointerId);
     }
   });
   ui.addEventListener("pointermove",e=>{
     if(!dragging) return;
-    roi.x=e.clientX-dx; roi.y=e.clientY-dy;
+    roi.x=e.clientX-dx;
+    roi.y=e.clientY-dy;
   });
   ui.addEventListener("pointerup",()=>dragging=false);
   ui.addEventListener("pointercancel",()=>dragging=false);
 
-  // draw cover (igual que se ve)
+  /* ===== Dibujo cover (igual que video visible) ===== */
   function drawCover(){
     const W=cv.width,H=cv.height;
     const vw=v.videoWidth,vh=v.videoHeight;
@@ -85,6 +92,7 @@
     return true;
   }
 
+  /* ===== Luminancia parche ===== */
   function readLum(){
     if(!drawCover()) return null;
     const cx=Math.floor(roi.x+ROI/2);
@@ -95,117 +103,92 @@
     const data=ctxV.getImageData(x,y,PATCH,PATCH).data;
     let sum=0;
     for(let i=0;i<data.length;i+=4){
-      sum += 0.2126*data[i] + 0.7152*data[i+1] + 0.0722*data[i+2];
+      sum+=0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2];
     }
-    return sum/(data.length/4); // 0..255
+    return sum/(data.length/4);
   }
 
-  // ===== Decoder por frames =====
-  let offLevel=null, onLevel=null;
+  /* ===== DECODER POR FRAMES ===== */
+  let offLevel=null,onLevel=null;
   let stableOn=false;
+  let onFrames=0,offFrames=0;
+  let current="",text="";
+  let started=false;
+  let letterClosed=false;
 
-  // contadores de frames
-  let onFrames=0, offFrames=0;
-
-  // para estimar unidad (dotFrames ~ 1u)
-  const dotSamples=[]; // recogemos ON cortos
+  const dotSamples=[];
   function pushDot(n){
-    if(n<=0) return;
     dotSamples.push(n);
     if(dotSamples.length>20) dotSamples.shift();
   }
   function dotUnit(){
-    if(dotSamples.length<4) return null;
+    if(dotSamples.length<5) return null;
     const s=[...dotSamples].sort((a,b)=>a-b);
-    return s[Math.floor(s.length/2)]; // mediana
+    return s[Math.floor(s.length/2)];
   }
-
-  let current="", text="";
-  let started=false; // evita basura inicial
 
   function flush(){
     if(!current) return;
-    text += MORSE[current] ?? "�";
-    out.textContent = text;
+    text+=MORSE[current]||"�";
+    out.textContent=text;
     current="";
   }
   function addSpace(){
     if(text && !text.endsWith(" ")){
-      text += " ";
-      out.textContent = text;
+      text+=" ";
+      out.textContent=text;
     }
-  }
-
-  function classifySymbol(n, u){
-    // dot ~ 1u, dash ~ 3u
-    // umbral ~2u
-    return (n < 2.0*u) ? "." : "-";
   }
 
   function processFrame(){
     const lum=readLum();
     if(lum==null) return;
 
-    // niveles adaptativos
     if(offLevel==null){ offLevel=onLevel=lum; }
 
     const thr=(offLevel+onLevel)/2;
     const hyster=8;
-    const rawOn = stableOn ? (lum > thr - hyster) : (lum > thr + hyster);
+    const rawOn = stableOn ? (lum>thr-hyster) : (lum>thr+hyster);
 
-    // actualizar niveles
     const a=0.06;
-    if(rawOn) onLevel += a*(lum-onLevel);
-    else      offLevel += a*(lum-offLevel);
-    if(onLevel < offLevel + 25) onLevel = offLevel + 25;
+    if(rawOn) onLevel+=a*(lum-onLevel);
+    else offLevel+=a*(lum-offLevel);
+    if(onLevel<offLevel+25) onLevel=offLevel+25;
 
-    // contadores por estado
     if(rawOn){
       onFrames++;
       if(!stableOn){
-        // OFF -> ON (transición)
-        // aquí decidimos si hubo gap de letra/palabra usando offFrames
-        const u = dotUnit();
+        const u=dotUnit();
         if(started && u){
-          if(offFrames >= 6.0*u){ flush(); addSpace(); }
-          else if(offFrames >= 2.2*u){ flush(); }
+          if(offFrames>=6*u){ flush(); addSpace(); letterClosed=true; }
+          else if(offFrames>=1.6*u){ flush(); letterClosed=true; }
         }
-        offFrames = 0;
-        stableOn = true;
+        offFrames=0;
+        stableOn=true;
       }
-    } else {
+    }else{
       offFrames++;
       if(stableOn){
-        // ON -> OFF (transición)
-        const u = dotUnit();
-
-        // Para arrancar: exige ver un ON suficientemente largo como “primer pulso”
-        // (así evitamos letra basura al inicio)
-        if(!started){
-          if(onFrames >= 2) started = true;
-        }
-
-        // aprende puntos: los ON más cortos tienden a ser "."
-        // Guardamos como dot sample si parece corto (sin u aún, lo guardamos igual)
-        if(onFrames > 0 && onFrames <= 12) pushDot(onFrames);
-
+        if(!started && onFrames>=2) started=true;
+        if(onFrames>0 && onFrames<=12) pushDot(onFrames);
+        const u=dotUnit();
         if(started && u){
-          current += classifySymbol(onFrames, u);
+          current+=(onFrames<2*u?".":"-");
+          letterClosed=false;
         }
-
-        onFrames = 0;
-        stableOn = false;
+        onFrames=0;
+        stableOn=false;
       }
     }
 
-    // cierre al final (OFF largo sin volver ON)
-    const u = dotUnit();
+    const u=dotUnit();
     if(started && !stableOn && u){
-      if(current && offFrames >= 2.8*u) flush();
-      if(offFrames >= 6.5*u) addSpace();
+      if(current && offFrames>=1.8*u && !letterClosed){
+        flush(); letterClosed=true;
+      }
+      if(offFrames>=6*u){ addSpace(); }
     }
 
-    // dibuja ROI
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
     ctxU.lineWidth=2;
@@ -213,21 +196,22 @@
   }
 
   function startLoop(){
-    if ("requestVideoFrameCallback" in HTMLVideoElement.prototype){
-      const step = () => { processFrame(); v.requestVideoFrameCallback(step); };
+    if("requestVideoFrameCallback"in HTMLVideoElement.prototype){
+      const step=()=>{processFrame();v.requestVideoFrameCallback(step);};
       v.requestVideoFrameCallback(step);
-    } else {
-      const step = () => { processFrame(); requestAnimationFrame(step); };
+    }else{
+      const step=()=>{processFrame();requestAnimationFrame(step);};
       step();
     }
   }
 
   navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
-    .then(stream=>{
-      v.srcObject=stream;
-      v.onloadedmetadata=()=>{ v.play(); startLoop(); };
+    .then(s=>{
+      v.srcObject=s;
+      v.onloadedmetadata=()=>{v.play();startLoop();};
     })
-    .catch(()=> out.textContent="No se pudo acceder a la cámara (usa https o localhost).");
+    .catch(()=>out.textContent="No se pudo acceder a la cámara");
+
 })();
 </script>
 </body>
