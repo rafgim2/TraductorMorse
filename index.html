@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (final definitivo)</title>
+<title>Morse Decoder (wait signal)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -28,20 +28,15 @@
 
 <script>
 (() => {
-
-  /* ===================== CONFIG ===================== */
-  const ROI_DRAW = 24;     // cuadrado visible
-  const ROI_READ = 64;     // zona real de lectura (más fácil)
+  const ROI_DRAW = 24;
+  const ROI_READ = 64;
   const SAMPLE_STEP = 4;
   const K_CONTRAST = 0.85;
 
-  const START_DELTA = 18;      // cuánto debe subir el score para considerar ON real
-  const START_ON_FRAMES = 6;   // frames ON seguidos para “hay señal”
-  const MIN_WORD_GAP_FRAMES = 45; // gap mínimo para detectar separador sin u
+  // “Enganche” de señal
+  const START_ON_FRAMES = 8;   // cuántos frames seguidos ON para considerar que empezó
+  const START_DELTA = 18;      // cuánto debe subir el score sobre baseline para ser ON (aprox)
 
-  const MIN_ON_BURSTS = 6;     // mínimo de pulsos ON antes de aceptar separador
-
-  /* ===================== MORSE ===================== */
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
     "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
@@ -52,7 +47,6 @@
     ".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
   };
 
-  /* ===================== DOM ===================== */
   const v = document.getElementById("v");
   const ui = document.getElementById("ui");
   const ctxU = ui.getContext("2d");
@@ -68,7 +62,7 @@
   addEventListener("resize", resize);
   resize();
 
-  /* ===================== ROI ARRASTRABLE ===================== */
+  // ROI drag (dibujado pequeño)
   let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
   ui.addEventListener("pointerdown",e=>{
     if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI_DRAW &&
@@ -84,7 +78,6 @@
   ui.addEventListener("pointerup",()=>dragging=false);
   ui.addEventListener("pointercancel",()=>dragging=false);
 
-  /* ===================== VIDEO → SCORE ===================== */
   function drawCover(){
     const W=cv.width,H=cv.height;
     const vw=v.videoWidth,vh=v.videoHeight;
@@ -102,46 +95,64 @@
     const cx=Math.floor(roi.x+ROI_DRAW/2);
     const cy=Math.floor(roi.y+ROI_DRAW/2);
     const half=Math.floor(ROI_READ/2);
-    const x=Math.max(0,Math.min(cv.width-ROI_READ,cx-half));
-    const y=Math.max(0,Math.min(cv.height-ROI_READ,cy-half));
+
+    const x=Math.max(0, Math.min(cv.width-ROI_READ, cx-half));
+    const y=Math.max(0, Math.min(cv.height-ROI_READ, cy-half));
 
     const img=ctxV.getImageData(x,y,ROI_READ,ROI_READ).data;
-    const bins=new Uint32Array(64);
 
-    let sum=0,count=0;
-    for(let yy=0;yy<ROI_READ;yy+=SAMPLE_STEP){
-      for(let xx=0;xx<ROI_READ;xx+=SAMPLE_STEP){
+    const bins=new Uint32Array(64);
+    let sum=0, count=0;
+
+    for(let yy=0; yy<ROI_READ; yy+=SAMPLE_STEP){
+      for(let xx=0; xx<ROI_READ; xx+=SAMPLE_STEP){
         const i=(yy*ROI_READ+xx)*4;
-        const r=img[i],g=img[i+1],b=img[i+2];
-        const lum=(0.2126*r+0.7152*g+0.0722*b)|0;
-        sum+=lum; bins[lum>>2]++; count++;
+        const r=img[i], g=img[i+1], b=img[i+2];
+        const lum = (0.2126*r + 0.7152*g + 0.0722*b) | 0;
+        sum += lum;
+        bins[lum>>2]++;
+        count++;
       }
     }
-    const mean=sum/Math.max(1,count);
 
-    let acc=0,p10=0,p90=255;
-    const p10T=count*0.10,p90T=count*0.90;
-    for(let i=0;i<bins.length;i++){ acc+=bins[i]; if(acc>=p10T){p10=i<<2; break;} }
+    const mean = sum / Math.max(1,count);
+
+    let acc=0;
+    const p10T=count*0.10, p90T=count*0.90;
+    let p10=0,p90=255;
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){p10=bi<<2; break;} }
     acc=0;
-    for(let i=0;i<bins.length;i++){ acc+=bins[i]; if(acc>=p90T){p90=i<<2; break;} }
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){p90=bi<<2; break;} }
 
-    return mean + K_CONTRAST*Math.max(0,p90-p10);
+    const contrast = Math.max(0, p90-p10);
+    return mean + K_CONTRAST*contrast;
   }
 
-  /* ===================== DECODER ===================== */
-  // Estados:
-  // 0 = WAIT_FIRST_ON
-  // 1 = SEEK_SEPARATOR
-  // 2 = DECODE
-  let STATE = 0;
+  // ===== Estado global =====
+  let WAIT_SIGNAL = true;
+  let baseline = null;
+  let startOnCount = 0;
 
-  let baseline=null,startOnCount=0;
-
-  let offLevel=null,onLevel=null,stableOn=false;
-  let onF=0,offF=0,current="",text="",letterClosed=false;
-  let seenOnBursts=0;
-
+  // Decoder state
+  let offLevel=null,onLevel=null, stableOn=false;
+  let onF=0, offF=0, current="", text="", letterClosed=false;
   const dots=[];
+
+  let ready=false, lastU=null, stableUCount=0;
+  let pendingWordGap=false, armed=false;
+
+  function resetSession(keepLearning=true){
+    current=""; text=""; out.textContent="";
+    letterClosed=false;
+    onF=0; offF=0; stableOn=false;
+    pendingWordGap=false; armed=false;
+
+    if(!keepLearning){
+      dots.length=0;
+      ready=false; lastU=null; stableUCount=0;
+    }
+  }
+
   function pushDot(n){ dots.push(n); if(dots.length>30) dots.shift(); }
   function dotUnit(){
     if(dots.length<8) return null;
@@ -149,27 +160,35 @@
     return s[Math.floor(s.length/2)];
   }
 
-  function resetForNewSignal(score){
-    dots.length=0;
-    offLevel=score;
-    onLevel=score+25;
-    stableOn=false;
-    onF=0; offF=0;
-    current=""; letterClosed=false;
-    seenOnBursts=0;
-    text=""; out.textContent="";
+  function updateReady(u){
+    if(!u){ stableUCount=0; lastU=null; ready=false; return; }
+    if(lastU!==null && Math.abs(u-lastU)<=1) stableUCount++; else stableUCount=0;
+    lastU=u;
+    if(stableUCount>=8) ready=true;
+    if(ready && pendingWordGap && !armed){
+      armed=true;
+      text=""; out.textContent="";
+      current="";
+    }
   }
 
-  function flush(u){
+  function flush(){
     if(!current) return;
-    if(STATE!==2){ current=""; return; }
-    text+=(MORSE[current]??"�");
+    if(!ready || !armed){ current=""; return; }
+    text += (MORSE[current] ?? "�");
     out.textContent=text;
     current="";
   }
 
   function addSpace(){
-    if(STATE!==2) return;
+    if(!ready) return;
+    if(!armed){
+      armed=true;
+      pendingWordGap=false;
+      text=""; out.textContent="";
+      current="";
+      return;
+    }
     if(text && !text.endsWith(" ")){
       text+=" ";
       out.textContent=text;
@@ -180,39 +199,35 @@
     if(offLevel==null){ offLevel=onLevel=score; }
 
     const thr=(offLevel+onLevel)/2;
-    const rawOn = stableOn ? (score>thr-10) : (score>thr+10);
+    const hyster=10;
+    const rawOn = stableOn ? (score>thr-hyster) : (score>thr+hyster);
 
     const a=0.08;
-    if(rawOn) onLevel+=a*(score-onLevel);
-    else offLevel+=a*(score-offLevel);
-    if(onLevel<offLevel+18) onLevel=offLevel+18;
+    if(rawOn) onLevel += a*(score-onLevel);
+    else      offLevel += a*(score-offLevel);
+    if(onLevel < offLevel + 18) onLevel = offLevel + 18;
 
     if(rawOn){
       onF++;
       if(!stableOn){
         const u=dotUnit();
-        const isWordGap=(u&&offF>=6*u)||(!u&&offF>=MIN_WORD_GAP_FRAMES);
-
-        if(STATE===1 && isWordGap && seenOnBursts>=MIN_ON_BURSTS){
-          STATE=2;
-          text=""; out.textContent="";
-          current="";
-        }
+        updateReady(u);
+        if(!ready && offF>=30) pendingWordGap=true;
 
         if(u){
-          if(offF>=6*u){ flush(u); addSpace(); letterClosed=true; }
-          else if(offF>=1.3*u){ flush(u); letterClosed=true; }
+          if(offF>=6*u){ flush(); addSpace(); letterClosed=true; }
+          else if(offF>=1.3*u){ flush(); letterClosed=true; }
         }
         offF=0; stableOn=true;
       }
     } else {
       offF++;
       if(stableOn){
-        seenOnBursts++;
-        if(onF>0&&onF<=16) pushDot(onF);
+        if(onF>0 && onF<=16) pushDot(onF);
         const u=dotUnit();
+        updateReady(u);
         if(u){
-          current+=(onF<2*u?".":"-");
+          current += (onF < 2*u ? "." : "-");
           letterClosed=false;
         }
         onF=0; stableOn=false;
@@ -220,31 +235,48 @@
     }
 
     const u=dotUnit();
-    if(!stableOn&&u){
-      if(current&&offF>=1.8*u&&!letterClosed){ flush(u); letterClosed=true; }
-      if(offF>=6*u && STATE===2) addSpace();
+    updateReady(u);
+
+    if(!stableOn){
+      if(u && offF>=12*u){ resetSession(true); } // fin sesión
+      if(!u && offF>=140){ resetSession(true); }
+
+      if(u){
+        if(current && offF>=1.8*u && !letterClosed){ flush(); letterClosed=true; }
+        if(offF>=6*u){
+          if(!ready) pendingWordGap=true;
+          addSpace();
+        }
+      } else {
+        if(offF>=30) pendingWordGap=true;
+      }
     }
   }
 
   function loop(){
-    const score=readScore();
+    const score = readScore();
     if(score==null) return;
 
+    // dibuja ROI
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
     ctxU.lineWidth=2;
     ctxU.strokeRect(roi.x,roi.y,ROI_DRAW,ROI_DRAW);
 
-    if(STATE===0){
+    // ===== WAIT_SIGNAL: no aprender ni decodificar hasta ver ON real =====
+    if(WAIT_SIGNAL){
       if(baseline==null) baseline=score;
-      baseline+=0.05*(score-baseline);
+      baseline = baseline + 0.05*(score-baseline); // baseline OFF
 
-      if(score>baseline+START_DELTA) startOnCount++;
-      else startOnCount=0;
+      if(score > baseline + START_DELTA) startOnCount++;
+      else startOnCount = 0;
 
-      if(startOnCount>=START_ON_FRAMES){
-        resetForNewSignal(score);
-        STATE=1;
+      if(startOnCount >= START_ON_FRAMES){
+        // señal empezó: arranque limpio
+        WAIT_SIGNAL = false;
+        resetSession(false); // resetea aprendizaje también para empezar fino
+        offLevel = baseline;
+        onLevel = baseline + 25;
       }
       return;
     }
@@ -253,16 +285,14 @@
   }
 
   function startLoop(){
-    STATE=0;
-    baseline=null; startOnCount=0;
-    offLevel=null; onLevel=null;
-    stableOn=false;
-    onF=0; offF=0;
-    current=""; text=""; out.textContent="";
-    letterClosed=false;
-    dots.length=0;
+    WAIT_SIGNAL = true;
+    baseline = null;
+    startOnCount = 0;
 
-    if("requestVideoFrameCallback"in HTMLVideoElement.prototype){
+    resetSession(false);
+    offLevel=null; onLevel=null;
+
+    if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
       const step=()=>{ loop(); v.requestVideoFrameCallback(step); };
       v.requestVideoFrameCallback(step);
     } else {
@@ -272,12 +302,11 @@
   }
 
   navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
-    .then(s=>{
-      v.srcObject=s;
+    .then(stream=>{
+      v.srcObject=stream;
       v.onloadedmetadata=()=>{ v.play(); startLoop(); };
     })
-    .catch(()=>out.textContent="No se pudo acceder a la cámara (usa https o localhost).");
-
+    .catch(()=> out.textContent="No se pudo acceder a la cámara (usa https o localhost).");
 })();
 </script>
 </body>
