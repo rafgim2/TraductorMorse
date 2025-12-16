@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (start on first space)</title>
+<title>Morse Decoder (final definitivo)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -28,19 +28,20 @@
 
 <script>
 (() => {
-  // ===== Ajustes “para que enganche fácil” =====
-  const ROI_DRAW = 24;   // cuadrado visible
-  const ROI_READ = 64;   // zona real que analizamos (más fácil)
+
+  /* ===================== CONFIG ===================== */
+  const ROI_DRAW = 24;     // cuadrado visible
+  const ROI_READ = 64;     // zona real de lectura (más fácil)
   const SAMPLE_STEP = 4;
   const K_CONTRAST = 0.85;
 
-  // Detectar que empezó señal (primer ON real)
-  const START_DELTA = 18;      // score por encima del baseline
-  const START_ON_FRAMES = 6;   // frames seguidos ON para “hay señal”
+  const START_DELTA = 18;      // cuánto debe subir el score para considerar ON real
+  const START_ON_FRAMES = 6;   // frames ON seguidos para “hay señal”
+  const MIN_WORD_GAP_FRAMES = 45; // gap mínimo para detectar separador sin u
 
-  // Detectar el “primer espacio” (gap de palabra) aunque u aún no exista
-  const MIN_WORD_GAP_FRAMES = 45; // seguro para 30–60fps (ajústalo si quieres)
+  const MIN_ON_BURSTS = 6;     // mínimo de pulsos ON antes de aceptar separador
 
+  /* ===================== MORSE ===================== */
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
     "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
@@ -51,6 +52,7 @@
     ".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
   };
 
+  /* ===================== DOM ===================== */
   const v = document.getElementById("v");
   const ui = document.getElementById("ui");
   const ctxU = ui.getContext("2d");
@@ -66,7 +68,7 @@
   addEventListener("resize", resize);
   resize();
 
-  // ROI arrastrable
+  /* ===================== ROI ARRASTRABLE ===================== */
   let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
   ui.addEventListener("pointerdown",e=>{
     if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI_DRAW &&
@@ -82,6 +84,7 @@
   ui.addEventListener("pointerup",()=>dragging=false);
   ui.addEventListener("pointercancel",()=>dragging=false);
 
+  /* ===================== VIDEO → SCORE ===================== */
   function drawCover(){
     const W=cv.width,H=cv.height;
     const vw=v.videoWidth,vh=v.videoHeight;
@@ -93,54 +96,50 @@
     return true;
   }
 
-  // score = mean + K*contrast (robusto)
   function readScore(){
     if(!drawCover()) return null;
+
     const cx=Math.floor(roi.x+ROI_DRAW/2);
     const cy=Math.floor(roi.y+ROI_DRAW/2);
     const half=Math.floor(ROI_READ/2);
-
-    const x=Math.max(0, Math.min(cv.width-ROI_READ, cx-half));
-    const y=Math.max(0, Math.min(cv.height-ROI_READ, cy-half));
+    const x=Math.max(0,Math.min(cv.width-ROI_READ,cx-half));
+    const y=Math.max(0,Math.min(cv.height-ROI_READ,cy-half));
 
     const img=ctxV.getImageData(x,y,ROI_READ,ROI_READ).data;
     const bins=new Uint32Array(64);
 
-    let sum=0, count=0;
-    for(let yy=0; yy<ROI_READ; yy+=SAMPLE_STEP){
-      for(let xx=0; xx<ROI_READ; xx+=SAMPLE_STEP){
+    let sum=0,count=0;
+    for(let yy=0;yy<ROI_READ;yy+=SAMPLE_STEP){
+      for(let xx=0;xx<ROI_READ;xx+=SAMPLE_STEP){
         const i=(yy*ROI_READ+xx)*4;
-        const r=img[i], g=img[i+1], b=img[i+2];
+        const r=img[i],g=img[i+1],b=img[i+2];
         const lum=(0.2126*r+0.7152*g+0.0722*b)|0;
-        sum+=lum;
-        bins[lum>>2]++;
-        count++;
+        sum+=lum; bins[lum>>2]++; count++;
       }
     }
     const mean=sum/Math.max(1,count);
 
-    let acc=0;
-    const p10T=count*0.10, p90T=count*0.90;
-    let p10=0,p90=255;
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){p10=bi<<2; break;} }
+    let acc=0,p10=0,p90=255;
+    const p10T=count*0.10,p90T=count*0.90;
+    for(let i=0;i<bins.length;i++){ acc+=bins[i]; if(acc>=p10T){p10=i<<2; break;} }
     acc=0;
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){p90=bi<<2; break;} }
+    for(let i=0;i<bins.length;i++){ acc+=bins[i]; if(acc>=p90T){p90=i<<2; break;} }
 
-    const contrast=Math.max(0,p90-p10);
-    return mean + K_CONTRAST*contrast;
+    return mean + K_CONTRAST*Math.max(0,p90-p10);
   }
 
-  // ===== Decoder (frames) + estados =====
-  // estados:
-  // 0 WAIT_FIRST_ON: solo baseline (si esperas, no pasa nada)
-  // 1 SEEK_SEPARATOR: hay señal; esperamos el primer gap largo (espacio tras preámbulo)
-  // 2 DECODE: mostramos mensaje real
+  /* ===================== DECODER ===================== */
+  // Estados:
+  // 0 = WAIT_FIRST_ON
+  // 1 = SEEK_SEPARATOR
+  // 2 = DECODE
   let STATE = 0;
 
-  let baseline=null, startOnCount=0;
+  let baseline=null,startOnCount=0;
 
-  let offLevel=null,onLevel=null, stableOn=false;
-  let onF=0, offF=0, current="", text="", letterClosed=false;
+  let offLevel=null,onLevel=null,stableOn=false;
+  let onF=0,offF=0,current="",text="",letterClosed=false;
+  let seenOnBursts=0;
 
   const dots=[];
   function pushDot(n){ dots.push(n); if(dots.length>30) dots.shift(); }
@@ -150,30 +149,29 @@
     return s[Math.floor(s.length/2)];
   }
 
-  function resetAllForNewSignal(score){
-    // reseteo completo cuando detecto el primer ON real
+  function resetForNewSignal(score){
     dots.length=0;
-    offLevel = score;
-    onLevel  = score + 25;
-    stableOn = false;
+    offLevel=score;
+    onLevel=score+25;
+    stableOn=false;
     onF=0; offF=0;
     current=""; letterClosed=false;
-
+    seenOnBursts=0;
     text=""; out.textContent="";
   }
 
   function flush(u){
     if(!current) return;
-    if(STATE !== 2){ current=""; return; } // solo mostramos en DECODE
-    text += (MORSE[current] ?? "�");
+    if(STATE!==2){ current=""; return; }
+    text+=(MORSE[current]??"�");
     out.textContent=text;
     current="";
   }
 
   function addSpace(){
-    if(STATE !== 2) return;
+    if(STATE!==2) return;
     if(text && !text.endsWith(" ")){
-      text += " ";
+      text+=" ";
       out.textContent=text;
     }
   }
@@ -182,90 +180,71 @@
     if(offLevel==null){ offLevel=onLevel=score; }
 
     const thr=(offLevel+onLevel)/2;
-    const hyster=10;
-    const rawOn = stableOn ? (score>thr-hyster) : (score>thr+hyster);
+    const rawOn = stableOn ? (score>thr-10) : (score>thr+10);
 
     const a=0.08;
-    if(rawOn) onLevel += a*(score-onLevel);
-    else      offLevel += a*(score-offLevel);
-    if(onLevel < offLevel + 18) onLevel = offLevel + 18;
+    if(rawOn) onLevel+=a*(score-onLevel);
+    else offLevel+=a*(score-offLevel);
+    if(onLevel<offLevel+18) onLevel=offLevel+18;
 
     if(rawOn){
       onF++;
       if(!stableOn){
-        // OFF -> ON
-        const u = dotUnit();
+        const u=dotUnit();
+        const isWordGap=(u&&offF>=6*u)||(!u&&offF>=MIN_WORD_GAP_FRAMES);
 
-        // ---- aquí detectamos el PRIMER ESPACIO (separador) ----
-        // Si estamos en SEEK_SEPARATOR y hemos tenido un OFF largo, ARMAMOS el mensaje
-        const isWordGap = (u && offF >= 6*u) || (!u && offF >= MIN_WORD_GAP_FRAMES);
-        if(STATE === 1 && isWordGap){
-          // Este es el espacio preámbulo→mensaje real
-          STATE = 2;
+        if(STATE===1 && isWordGap && seenOnBursts>=MIN_ON_BURSTS){
+          STATE=2;
           text=""; out.textContent="";
           current="";
         }
 
-        // gaps normales (solo decodifica si ya estamos en DECODE)
         if(u){
-          if(offF >= 6*u){ flush(u); addSpace(); letterClosed=true; }
-          else if(offF >= 1.3*u){ flush(u); letterClosed=true; }
+          if(offF>=6*u){ flush(u); addSpace(); letterClosed=true; }
+          else if(offF>=1.3*u){ flush(u); letterClosed=true; }
         }
-
-        offF=0;
-        stableOn=true;
+        offF=0; stableOn=true;
       }
     } else {
       offF++;
       if(stableOn){
-        // ON -> OFF: símbolo
-        if(onF>0 && onF<=16) pushDot(onF);
+        seenOnBursts++;
+        if(onF>0&&onF<=16) pushDot(onF);
         const u=dotUnit();
         if(u){
-          current += (onF < 2*u ? "." : "-");
+          current+=(onF<2*u?".":"-");
           letterClosed=false;
         }
-        onF=0;
-        stableOn=false;
+        onF=0; stableOn=false;
       }
     }
 
-    // cierre por silencio
     const u=dotUnit();
-    if(!stableOn){
-      if(u){
-        if(current && offF >= 1.8*u && !letterClosed){ flush(u); letterClosed=true; }
-        if(offF >= 6*u){
-          // si aún estamos buscando separador, esto también cuenta como “posible”
-          // pero el paso a DECODE lo hacemos en el siguiente OFF->ON (arriba)
-          if(STATE === 2) addSpace();
-        }
-      }
+    if(!stableOn&&u){
+      if(current&&offF>=1.8*u&&!letterClosed){ flush(u); letterClosed=true; }
+      if(offF>=6*u && STATE===2) addSpace();
     }
   }
 
   function loop(){
-    const score = readScore();
+    const score=readScore();
     if(score==null) return;
 
-    // dibuja ROI
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
     ctxU.lineWidth=2;
     ctxU.strokeRect(roi.x,roi.y,ROI_DRAW,ROI_DRAW);
 
-    if(STATE === 0){
-      // baseline OFF mientras no haya señal
+    if(STATE===0){
       if(baseline==null) baseline=score;
-      baseline = baseline + 0.05*(score-baseline);
+      baseline+=0.05*(score-baseline);
 
-      if(score > baseline + START_DELTA) startOnCount++;
-      else startOnCount = 0;
+      if(score>baseline+START_DELTA) startOnCount++;
+      else startOnCount=0;
 
-      if(startOnCount >= START_ON_FRAMES){
-        // primer ON real detectado -> reseteo y paso a buscar separador
-        resetAllForNewSignal(score);
-        STATE = 1; // SEEK_SEPARATOR
+      if(startOnCount>=START_ON_FRAMES){
+        resetForNewSignal(score);
+        STATE=1;
       }
       return;
     }
@@ -274,9 +253,8 @@
   }
 
   function startLoop(){
-    STATE = 0;
-    baseline = null;
-    startOnCount = 0;
+    STATE=0;
+    baseline=null; startOnCount=0;
     offLevel=null; onLevel=null;
     stableOn=false;
     onF=0; offF=0;
@@ -284,7 +262,7 @@
     letterClosed=false;
     dots.length=0;
 
-    if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
+    if("requestVideoFrameCallback"in HTMLVideoElement.prototype){
       const step=()=>{ loop(); v.requestVideoFrameCallback(step); };
       v.requestVideoFrameCallback(step);
     } else {
@@ -294,14 +272,13 @@
   }
 
   navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
-    .then(stream=>{
-      v.srcObject=stream;
+    .then(s=>{
+      v.srcObject=s;
       v.onloadedmetadata=()=>{ v.play(); startLoop(); };
     })
-    .catch(()=> out.textContent="No se pudo acceder a la cámara (usa https o localhost).");
+    .catch(()=>out.textContent="No se pudo acceder a la cámara (usa https o localhost).");
+
 })();
 </script>
 </body>
 </html>
-
-
