@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (más fácil)</title>
+<title>Morse Decoder (wait signal)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -28,13 +28,14 @@
 
 <script>
 (() => {
-  /* ===== UI mínima ===== */
-  const ROI_DRAW = 24;     // cuadrado que ves
-  const ROI_READ = 64;     // cuadrado REAL que se analiza (más fácil)
-  const SAMPLE_STEP = 4;   // submuestreo (rendimiento)
+  const ROI_DRAW = 24;
+  const ROI_READ = 64;
+  const SAMPLE_STEP = 4;
+  const K_CONTRAST = 0.85;
 
-  /* Score = mean + K * contrast */
-  const K_CONTRAST = 0.85; // sube si aún le cuesta, baja si parpadea
+  // “Enganche” de señal
+  const START_ON_FRAMES = 8;   // cuántos frames seguidos ON para considerar que empezó
+  const START_DELTA = 18;      // cuánto debe subir el score sobre baseline para ser ON (aprox)
 
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
@@ -52,7 +53,7 @@
   const out = document.getElementById("out");
 
   const cv = document.createElement("canvas");
-  const ctxV = cv.getContext("2d", { willReadFrequently:true });
+  const ctxV = cv.getContext("2d",{willReadFrequently:true});
 
   function resize(){
     ui.width = cv.width = innerWidth;
@@ -61,107 +62,102 @@
   addEventListener("resize", resize);
   resize();
 
-  /* ROI arrastrable (se dibuja pequeño pero analiza grande) */
-  let roi = { x: 80, y: 80 };
-  let dragging=false, dx=0, dy=0;
-
-  ui.addEventListener("pointerdown", e=>{
-    if(e.clientX>=roi.x && e.clientX<=roi.x+ROI_DRAW &&
-       e.clientY>=roi.y && e.clientY<=roi.y+ROI_DRAW){
+  // ROI drag (dibujado pequeño)
+  let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
+  ui.addEventListener("pointerdown",e=>{
+    if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI_DRAW &&
+       e.clientY>=roi.y&&e.clientY<=roi.y+ROI_DRAW){
       dragging=true; dx=e.clientX-roi.x; dy=e.clientY-roi.y;
       ui.setPointerCapture(e.pointerId);
     }
   });
-  ui.addEventListener("pointermove", e=>{
+  ui.addEventListener("pointermove",e=>{
     if(!dragging) return;
-    roi.x=e.clientX-dx;
-    roi.y=e.clientY-dy;
+    roi.x=e.clientX-dx; roi.y=e.clientY-dy;
   });
-  ui.addEventListener("pointerup", ()=>dragging=false);
-  ui.addEventListener("pointercancel", ()=>dragging=false);
+  ui.addEventListener("pointerup",()=>dragging=false);
+  ui.addEventListener("pointercancel",()=>dragging=false);
 
   function drawCover(){
-    const W=cv.width, H=cv.height;
-    const vw=v.videoWidth, vh=v.videoHeight;
-    if(!vw || !vh) return false;
-    const s = Math.max(W/vw, H/vh);
-    const dw = vw*s, dh = vh*s;
-    const ox = (W-dw)/2, oy = (H-dh)/2;
+    const W=cv.width,H=cv.height;
+    const vw=v.videoWidth,vh=v.videoHeight;
+    if(!vw||!vh) return false;
+    const s=Math.max(W/vw,H/vh);
+    const dw=vw*s, dh=vh*s;
+    const ox=(W-dw)/2, oy=(H-dh)/2;
     ctxV.drawImage(v, ox, oy, dw, dh);
     return true;
   }
 
-  // Devuelve {mean, p10, p90} de luminancia en el ROI_READ
-  function readStats(){
+  function readScore(){
     if(!drawCover()) return null;
 
-    const cx = Math.floor(roi.x + ROI_DRAW/2);
-    const cy = Math.floor(roi.y + ROI_DRAW/2);
+    const cx=Math.floor(roi.x+ROI_DRAW/2);
+    const cy=Math.floor(roi.y+ROI_DRAW/2);
+    const half=Math.floor(ROI_READ/2);
 
-    const half = Math.floor(ROI_READ/2);
-    const x = Math.max(0, Math.min(cv.width-ROI_READ, cx-half));
-    const y = Math.max(0, Math.min(cv.height-ROI_READ, cy-half));
+    const x=Math.max(0, Math.min(cv.width-ROI_READ, cx-half));
+    const y=Math.max(0, Math.min(cv.height-ROI_READ, cy-half));
 
-    const img = ctxV.getImageData(x,y,ROI_READ,ROI_READ).data;
+    const img=ctxV.getImageData(x,y,ROI_READ,ROI_READ).data;
 
-    // muestreo + histograma aproximado
-    const bins = new Uint32Array(64); // 0..255 -> 64 bins
+    const bins=new Uint32Array(64);
     let sum=0, count=0;
 
     for(let yy=0; yy<ROI_READ; yy+=SAMPLE_STEP){
       for(let xx=0; xx<ROI_READ; xx+=SAMPLE_STEP){
-        const i = (yy*ROI_READ + xx)*4;
+        const i=(yy*ROI_READ+xx)*4;
         const r=img[i], g=img[i+1], b=img[i+2];
         const lum = (0.2126*r + 0.7152*g + 0.0722*b) | 0;
         sum += lum;
-        bins[lum>>2]++; // /4
+        bins[lum>>2]++;
         count++;
       }
     }
 
     const mean = sum / Math.max(1,count);
 
-    // percentiles sobre histograma
     let acc=0;
-    const p10Target = count * 0.10;
-    const p90Target = count * 0.90;
-    let p10=0, p90=255;
-
-    for(let bi=0; bi<bins.length; bi++){
-      acc += bins[bi];
-      if(acc >= p10Target){ p10 = bi<<2; break; }
-    }
+    const p10T=count*0.10, p90T=count*0.90;
+    let p10=0,p90=255;
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){p10=bi<<2; break;} }
     acc=0;
-    for(let bi=0; bi<bins.length; bi++){
-      acc += bins[bi];
-      if(acc >= p90Target){ p90 = bi<<2; break; }
-    }
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){p90=bi<<2; break;} }
 
-    return { mean, p10, p90 };
+    const contrast = Math.max(0, p90-p10);
+    return mean + K_CONTRAST*contrast;
   }
 
-  /* ===== Decoder por frames + sesión ===== */
-  let offLevel=null, onLevel=null;
-  let stableOn=false;
-  let onF=0, offF=0;
-  let current="", text="";
-  let letterClosed=false;
+  // ===== Estado global =====
+  let WAIT_SIGNAL = true;
+  let baseline = null;
+  let startOnCount = 0;
 
+  // Decoder state
+  let offLevel=null,onLevel=null, stableOn=false;
+  let onF=0, offF=0, current="", text="", letterClosed=false;
   const dots=[];
-  function pushDot(n){ dots.push(n); if(dots.length>30) dots.shift(); }
-  function dotUnit(){
-    if(dots.length < 8) return null;
-    const s=[...dots].sort((a,b)=>a-b);
-    return s[Math.floor(s.length/2)];
-  }
 
   let ready=false, lastU=null, stableUCount=0;
   let pendingWordGap=false, armed=false;
 
-  function resetSession(){
-    current=""; letterClosed=false;
+  function resetSession(keepLearning=true){
+    current=""; text=""; out.textContent="";
+    letterClosed=false;
+    onF=0; offF=0; stableOn=false;
     pendingWordGap=false; armed=false;
-    text=""; out.textContent="";
+
+    if(!keepLearning){
+      dots.length=0;
+      ready=false; lastU=null; stableUCount=0;
+    }
+  }
+
+  function pushDot(n){ dots.push(n); if(dots.length>30) dots.shift(); }
+  function dotUnit(){
+    if(dots.length<8) return null;
+    const s=[...dots].sort((a,b)=>a-b);
+    return s[Math.floor(s.length/2)];
   }
 
   function updateReady(u){
@@ -180,7 +176,7 @@
     if(!current) return;
     if(!ready || !armed){ current=""; return; }
     text += (MORSE[current] ?? "�");
-    out.textContent = text;
+    out.textContent=text;
     current="";
   }
 
@@ -199,20 +195,12 @@
     }
   }
 
-  function processFrame(){
-    const st = readStats();
-    if(!st) return;
-
-    // score robusto: media + contraste
-    const contrast = Math.max(0, st.p90 - st.p10);
-    const score = st.mean + K_CONTRAST * contrast;
-
-    // niveles adaptativos sobre score
+  function processDecoder(score){
     if(offLevel==null){ offLevel=onLevel=score; }
 
     const thr=(offLevel+onLevel)/2;
     const hyster=10;
-    const rawOn = stableOn ? (score > thr - hyster) : (score > thr + hyster);
+    const rawOn = stableOn ? (score>thr-hyster) : (score>thr+hyster);
 
     const a=0.08;
     if(rawOn) onLevel += a*(score-onLevel);
@@ -224,19 +212,18 @@
       if(!stableOn){
         const u=dotUnit();
         updateReady(u);
-
-        if(!ready && offF >= 30) pendingWordGap = true;
+        if(!ready && offF>=30) pendingWordGap=true;
 
         if(u){
-          if(offF >= 6*u){ flush(); addSpace(); letterClosed=true; }
-          else if(offF >= 1.3*u){ flush(); letterClosed=true; }
+          if(offF>=6*u){ flush(); addSpace(); letterClosed=true; }
+          else if(offF>=1.3*u){ flush(); letterClosed=true; }
         }
         offF=0; stableOn=true;
       }
     } else {
       offF++;
       if(stableOn){
-        if(onF>0 && onF<=16) pushDot(onF); // más permisivo
+        if(onF>0 && onF<=16) pushDot(onF);
         const u=dotUnit();
         updateReady(u);
         if(u){
@@ -251,39 +238,70 @@
     updateReady(u);
 
     if(!stableOn){
-      if((u && offF >= 12*u) || (!u && offF >= 140)){
-        resetSession();
-      }
+      if(u && offF>=12*u){ resetSession(true); } // fin sesión
+      if(!u && offF>=140){ resetSession(true); }
+
       if(u){
-        if(current && offF >= 1.8*u && !letterClosed){ flush(); letterClosed=true; }
-        if(offF >= 6*u){
+        if(current && offF>=1.8*u && !letterClosed){ flush(); letterClosed=true; }
+        if(offF>=6*u){
           if(!ready) pendingWordGap=true;
           addSpace();
         }
       } else {
-        if(offF >= 30) pendingWordGap=true;
+        if(offF>=30) pendingWordGap=true;
       }
     }
+  }
 
-    // dibuja ROI pequeño
+  function loop(){
+    const score = readScore();
+    if(score==null) return;
+
+    // dibuja ROI
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
     ctxU.lineWidth=2;
-    ctxU.strokeRect(roi.x, roi.y, ROI_DRAW, ROI_DRAW);
+    ctxU.strokeRect(roi.x,roi.y,ROI_DRAW,ROI_DRAW);
+
+    // ===== WAIT_SIGNAL: no aprender ni decodificar hasta ver ON real =====
+    if(WAIT_SIGNAL){
+      if(baseline==null) baseline=score;
+      baseline = baseline + 0.05*(score-baseline); // baseline OFF
+
+      if(score > baseline + START_DELTA) startOnCount++;
+      else startOnCount = 0;
+
+      if(startOnCount >= START_ON_FRAMES){
+        // señal empezó: arranque limpio
+        WAIT_SIGNAL = false;
+        resetSession(false); // resetea aprendizaje también para empezar fino
+        offLevel = baseline;
+        onLevel = baseline + 25;
+      }
+      return;
+    }
+
+    processDecoder(score);
   }
 
   function startLoop(){
-    resetSession();
+    WAIT_SIGNAL = true;
+    baseline = null;
+    startOnCount = 0;
+
+    resetSession(false);
+    offLevel=null; onLevel=null;
+
     if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
-      const step=()=>{ processFrame(); v.requestVideoFrameCallback(step); };
+      const step=()=>{ loop(); v.requestVideoFrameCallback(step); };
       v.requestVideoFrameCallback(step);
     } else {
-      const step=()=>{ processFrame(); requestAnimationFrame(step); };
+      const step=()=>{ loop(); requestAnimationFrame(step); };
       step();
     }
   }
 
-  navigator.mediaDevices.getUserMedia({ video:{ facingMode:"environment" }, audio:false })
+  navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
     .then(stream=>{
       v.srcObject=stream;
       v.onloadedmetadata=()=>{ v.play(); startLoop(); };
