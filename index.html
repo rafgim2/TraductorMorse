@@ -2,348 +2,430 @@
 <html lang="es">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>Morse Reader (Robust + Scramble)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Morse Decoder (Beacon por cámara)</title>
   <style>
-    html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#eaeaea;}
-    .wrap{position:relative;width:100vw;height:100vh;}
-    video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
-    canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
-
-    .start{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);text-align:center;padding:24px;}
-    .start button{background:#1f1f1f;border:1px solid #3a3a3a;color:#eaeaea;border-radius:14px;padding:12px 16px;font-size:16px;cursor:pointer;}
-    .start p{margin:10px 0 0;opacity:.8;font-size:13px;line-height:1.35}
-
-    .hud{
-      position:absolute;left:12px;right:12px;bottom:12px;
-      background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.15);
-      border-radius:16px;padding:10px 12px;backdrop-filter:blur(6px);
+    :root { color-scheme: dark; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background:#050607; color:#d7ffe0; }
+    .wrap { display:grid; grid-template-columns: 1fr 360px; gap:14px; padding:14px; }
+    .stage { position:relative; border:1px solid #0d3; border-radius:14px; overflow:hidden; background:#000; }
+    video { width:100%; height:auto; display:block; transform: scaleX(-1); } /* espejo opcional */
+    canvas.overlay { position:absolute; inset:0; pointer-events:none; }
+    .panel { border:1px solid #0d3; border-radius:14px; padding:12px; background: rgba(0,40,20,.25); }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+    label { font-size:14px; opacity:.9; }
+    select, button, input[type="range"] {
+      background:#06140c; color:#7CFF9D; border:1px solid #0d3; border-radius:10px; padding:8px 10px;
     }
-    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
-    .pill{padding:3px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.35);font-size:13px;opacity:.9}
-    .mono{font-family:ui-monospace,Menlo,Consolas,monospace;}
-    .big{font-size:24px;white-space:pre-wrap;word-break:break-word;line-height:1.25}
-    button.small{background:#222;border:1px solid #333;color:#eaeaea;border-radius:12px;padding:8px 10px;font-size:14px;cursor:pointer;}
-    input.small{width:72px;background:#111;border:1px solid #333;color:#eaeaea;border-radius:12px;padding:8px 10px;font-size:14px;}
-    .sub{opacity:.75;font-size:13px}
+    button { cursor:pointer; }
+    button:disabled { opacity:.4; cursor:not-allowed; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    textarea {
+      width:100%; height:160px; resize:vertical;
+      background:#06140c; color:#7CFF9D; border:1px solid #0d3; border-radius:12px; padding:10px;
+      outline:none;
+    }
+    .hint { font-size:12px; opacity:.75; line-height:1.35; }
+    .meter { display:flex; align-items:center; gap:10px; }
+    .bar { flex:1; height:10px; border-radius:999px; border:1px solid #0d3; background:#06140c; overflow:hidden; }
+    .bar > i { display:block; height:100%; width:0%; background:#0d3; }
+    .pill { padding:4px 8px; border:1px solid #0d3; border-radius:999px; font-size:12px; opacity:.9; }
   </style>
 </head>
-
 <body>
-<div class="wrap">
-  <video id="video" autoplay playsinline muted></video>
-  <canvas id="ui"></canvas>
+  <div class="wrap">
+    <div class="stage" id="stage">
+      <video id="video" playsinline autoplay muted></video>
+      <canvas id="overlay" class="overlay"></canvas>
+    </div>
 
-  <div id="startOverlay" class="start">
-    <div>
-      <button id="btnStart">Toca para iniciar la cámara</button>
-      <p>
-        Mete el beacon dentro del marco.<br>
-        Emisor recomendado: unidad 250 ms.
-      </p>
+    <div class="panel">
+      <div class="row">
+        <button id="btnStart">Iniciar cámara</button>
+        <button id="btnListen" disabled>Escuchar Morse</button>
+        <button id="btnClear" disabled>Limpiar</button>
+      </div>
+
+      <div class="row">
+        <label>Unidad (ms):</label>
+        <select id="unitMs">
+          <option>120</option>
+          <option>150</option>
+          <option>200</option>
+          <option selected>250</option>
+          <option>300</option>
+          <option>400</option>
+        </select>
+        <span class="pill mono" id="state">OFF</span>
+      </div>
+
+      <div class="row meter">
+        <label class="mono">Brillo</label>
+        <div class="bar"><i id="barFill"></i></div>
+        <span class="pill mono" id="lux">0.000</span>
+      </div>
+
+      <div class="row">
+        <label>Sensibilidad:</label>
+        <input id="sens" type="range" min="0" max="100" value="55" />
+        <span class="pill mono" id="sensVal">55</span>
+      </div>
+
+      <div class="row">
+        <label class="mono">Símbolos:</label>
+        <span class="pill mono" id="symbols"> </span>
+      </div>
+
+      <div class="row">
+        <label>Texto decodificado:</label>
+      </div>
+      <textarea id="out" placeholder="Aquí irán apareciendo las letras..."></textarea>
+
+      <div class="hint">
+        <b>Uso:</b> Inicia cámara → coloca el beacon dentro del recuadro (arrástralo con el ratón/tacto) →
+        pulsa <b>Escuchar Morse</b>. Ajusta <b>Unidad</b> al mismo valor que uses al emitir.
+        <br/><br/>
+        <b>Tip:</b> Si hay ruido (parpadeos), baja o sube <b>Sensibilidad</b> hasta que el estado OFF/ON sea estable.
+      </div>
     </div>
   </div>
-
-  <div class="hud">
-    <div class="row">
-      <span id="state" class="pill">—</span>
-      <span id="dval" class="pill mono">Δ: —</span>
-      <span class="pill mono">Dot(ms): <input id="dotMs" class="small" value="250"></span>
-      <span class="pill mono">Sens: <input id="sens" class="small" value="1.8"></span>
-      <button class="small" id="btnClear">Borrar</button>
-    </div>
-    <div style="margin-top:8px" class="mono sub">Secuencia: <span id="seq">—</span></div>
-    <div style="margin-top:8px" class="mono big" id="out">(mensaje)</div>
-  </div>
-</div>
 
 <script>
-/* ===== ROI (ajústalo a dónde está tu beacon en el vídeo) =====
-   Por defecto: arriba-derecha
-*/
-const ROI = {
-  wPct: 0.42,
-  hPct: 0.25,
-  xCenterPct: 0.80,
-  yCenterPct: 0.20
-};
+(() => {
+  // --- Morse map ---
+  const MORSE = {
+    ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F","--.":"G","....":"H","..":"I",
+    ".---":"J","-.-":"K",".-..":"L","--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
+    "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X","-.--":"Y","--..":"Z",
+    "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",".....":"5","-....":"6","--...":"7","---..":"8","----.":"9",
+    ".-.-.-":".","--..--":",","..--..":"?","-.-.--":"!","-....-":"-",".----.":"'","-..-.":"/","-.--.":"(","-.--.-":")",
+    ".-..-.":'"',".--.-.":"@","---...":":","-.-.-.":";","..--.-":"_","...-..-":"$",".-...":"&","-...-":"=",".-.-.":"+"
+  };
 
-// Scramble
-const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789?/#@$%&*+-";
-const SCRAMBLE_HOLD_MS = 260;  // duración del glitch por letra
-const SCRAMBLE_STEP_MS = 35;
+  // --- Elements ---
+  const video = document.getElementById("video");
+  const overlay = document.getElementById("overlay");
+  const ctx = overlay.getContext("2d", { willReadFrequently: true });
 
-// Morse map
-const MORSE_TO_CHAR = {
-  ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F","--.":"G","....":"H","..":"I",
-  ".---":"J","-.-":"K",".-..":"L","--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
-  "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X","-.--":"Y","--..":"Z",
-  "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
-};
+  const btnStart = document.getElementById("btnStart");
+  const btnListen = document.getElementById("btnListen");
+  const btnClear = document.getElementById("btnClear");
 
-const video = document.getElementById('video');
-const ui = document.getElementById('ui');
-const ctx = ui.getContext('2d');
+  const unitSel = document.getElementById("unitMs");
+  const out = document.getElementById("out");
+  const symbolsEl = document.getElementById("symbols");
+  const stateEl = document.getElementById("state");
 
-const startOverlay = document.getElementById('startOverlay');
-const btnStart = document.getElementById('btnStart');
-const btnClear = document.getElementById('btnClear');
+  const barFill = document.getElementById("barFill");
+  const luxEl = document.getElementById("lux");
+  const sens = document.getElementById("sens");
+  const sensVal = document.getElementById("sensVal");
 
-const elState = document.getElementById('state');
-const elDval  = document.getElementById('dval');
-const elSeq   = document.getElementById('seq');
-const elOut   = document.getElementById('out');
+  // --- ROI rectangle (movable) in overlay coordinates ---
+  let roi = { x: 0.72, y: 0.10, w: 0.22, h: 0.22 }; // normalized
+  let dragging = false;
+  let dragOffset = { x: 0, y: 0 };
 
-const dotInput = document.getElementById('dotMs');
-const sensInput = document.getElementById('sens');
+  function clamp(v,min,max){ return Math.max(min, Math.min(max,v)); }
 
-const frame = document.createElement('canvas');
-const fctx = frame.getContext('2d', { willReadFrequently:true });
-
-let stream = null;
-
-function resize(){
-  ui.width = innerWidth; ui.height = innerHeight;
-  frame.width = innerWidth; frame.height = innerHeight;
-}
-addEventListener('resize', resize);
-resize();
-
-function roiRect(){
-  const w = Math.floor(ui.width * ROI.wPct);
-  const h = Math.floor(ui.height * ROI.hPct);
-  const x = Math.floor(ui.width * ROI.xCenterPct - w/2);
-  const y = Math.floor(ui.height * ROI.yCenterPct - h/2);
-  return { x:Math.max(0,x), y:Math.max(0,y), w, h };
-}
-
-// Un ROI “anillo” alrededor para medir fondo (evita autoexposición)
-function bgRect(){
-  const r = roiRect();
-  const padX = Math.floor(r.w * 0.25);
-  const padY = Math.floor(r.h * 0.25);
-  const x = Math.max(0, r.x - padX);
-  const y = Math.max(0, r.y - padY);
-  const w = Math.min(ui.width - x, r.w + 2*padX);
-  const h = Math.min(ui.height - y, r.h + 2*padY);
-  return { x, y, w, h };
-}
-
-function drawUI(){
-  ctx.clearRect(0,0,ui.width,ui.height);
-  const {x,y,w,h} = roiRect();
-  ctx.lineWidth = 3;
-  ctx.strokeStyle = "rgba(0,255,120,0.92)";
-  ctx.strokeRect(x,y,w,h);
-  const c=18;
-  ctx.lineWidth=5;
-  ctx.beginPath(); ctx.moveTo(x,y+c); ctx.lineTo(x,y); ctx.lineTo(x+c,y); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(x+w-c,y); ctx.lineTo(x+w,y); ctx.lineTo(x+w,y+c); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(x,y+h-c); ctx.lineTo(x,y+h); ctx.lineTo(x+c,y+h); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(x+w-c,y+h); ctx.lineTo(x+w,y+h); ctx.lineTo(x+w,y+h-c); ctx.stroke();
-}
-
-function drawCover(){
-  const sw=frame.width, sh=frame.height;
-  const vw=video.videoWidth, vh=video.videoHeight;
-  if(!vw||!vh) return false;
-  const scale = Math.max(sw/vw, sh/vh);
-  const dw = vw*scale, dh = vh*scale;
-  const dx = (sw-dw)/2, dy = (sh-dh)/2;
-  fctx.clearRect(0,0,sw,sh);
-  fctx.drawImage(video, dx, dy, dw, dh);
-  return true;
-}
-
-function avgLuma(rect, skipInnerRect=null){
-  const img = fctx.getImageData(rect.x, rect.y, rect.w, rect.h);
-  const d = img.data;
-  let sum=0, n=0;
-
-  // muestreo (rápido)
-  const step = 24;
-
-  // si queremos excluir el ROI central del fondo, lo hacemos por coordenadas
-  const ex = skipInnerRect;
-
-  for(let i=0;i<d.length;i+=step){
-    const px = ((i/4) % rect.w) | 0;
-    const py = ((i/4 / rect.w)) | 0;
-
-    if (ex){
-      const sx = rect.x + px;
-      const sy = rect.y + py;
-      if (sx >= ex.x && sx < ex.x+ex.w && sy >= ex.y && sy < ex.y+ex.h) continue;
-    }
-
-    const r=d[i], g=d[i+1], b=d[i+2];
-    const lum = 0.2126*r + 0.7152*g + 0.0722*b;
-    sum += lum; n++;
-  }
-  return n ? sum/n : 0;
-}
-
-/* ===== Decoder con umbral adaptativo + histéresis ===== */
-let baseline = 0;         // baseline del Δ
-let sigma = 0;            // variabilidad del Δ
-let on = false;
-let lastChange = performance.now();
-
-let currentSymbol = "";
-let seqVisible = "";
-let stableText = "";
-let pending = [];
-let scrambling = false;
-
-function randChar(){
-  return SCRAMBLE_CHARS[Math.floor(Math.random()*SCRAMBLE_CHARS.length)];
-}
-
-function enqueueChars(s){
-  for(const ch of s) pending.push(ch);
-  if(!scrambling) runScramble();
-}
-
-async function runScramble(){
-  scrambling = true;
-  while(pending.length){
-    const ch = pending.shift();
-    if (ch === " "){
-      stableText += " ";
-      elOut.textContent = stableText || "(mensaje)";
-      continue;
-    }
-    // glitch
-    const t0 = performance.now();
-    while(performance.now() - t0 < SCRAMBLE_HOLD_MS){
-      elOut.textContent = stableText + randChar();
-      await new Promise(r=>setTimeout(r, SCRAMBLE_STEP_MS));
-    }
-    stableText += ch;
-    elOut.textContent = stableText || "(mensaje)";
-  }
-  scrambling = false;
-}
-
-function addSymbol(sym){
-  currentSymbol += sym;
-  seqVisible += sym;
-  elSeq.textContent = seqVisible || "—";
-}
-
-function commitLetter(){
-  if(!currentSymbol) return;
-  const ch = MORSE_TO_CHAR[currentSymbol] || "�";
-  enqueueChars(ch);
-  currentSymbol = "";
-}
-
-function commitWord(){
-  commitLetter();
-  enqueueChars(" ");
-}
-
-function resetAll(){
-  baseline = 0; sigma = 0;
-  on = false;
-  lastChange = performance.now();
-  currentSymbol = "";
-  seqVisible = "";
-  elSeq.textContent = "—";
-  stableText = "";
-  pending = [];
-  scrambling = false;
-  elOut.textContent = "(mensaje)";
-}
-
-function updateState(nextOn, dotMs){
-  const now = performance.now();
-  if(nextOn === on) return;
-
-  const dt = now - lastChange;
-
-  const DOT_MAX = dotMs * 2.0;
-  const DASH_MIN = dotMs * 2.0;
-  const LETTER_GAP_MIN = dotMs * 2.2;
-  const WORD_GAP_MIN   = dotMs * 5.5;
-
-  if(on){
-    // ON -> OFF: duración pulso
-    if(dt <= DOT_MAX) addSymbol(".");
-    else if(dt >= DASH_MIN) addSymbol("-");
-    else addSymbol(".");
-  } else {
-    // OFF -> ON: duración silencio
-    if(dt >= WORD_GAP_MIN){
-      commitWord(); seqVisible += " / "; elSeq.textContent = seqVisible || "—";
-    } else if(dt >= LETTER_GAP_MIN){
-      commitLetter(); seqVisible += " "; elSeq.textContent = seqVisible || "—";
-    }
+  function overlaySizeToVideo() {
+    // match overlay to displayed video size
+    const rect = video.getBoundingClientRect();
+    overlay.width = Math.floor(rect.width * devicePixelRatio);
+    overlay.height = Math.floor(rect.height * devicePixelRatio);
   }
 
-  lastChange = now;
-  on = nextOn;
-}
+  function drawOverlay() {
+    const w = overlay.width, h = overlay.height;
+    ctx.clearRect(0,0,w,h);
 
-function loop(){
-  requestAnimationFrame(loop);
-  drawUI();
-  if(!stream) return;
-  if(!drawCover()) return;
+    // ROI rect
+    const rx = roi.x * w, ry = roi.y * h, rw = roi.w * w, rh = roi.h * h;
 
-  const r = roiRect();
-  const b = bgRect();
+    ctx.lineWidth = 3 * devicePixelRatio;
+    ctx.strokeStyle = "rgba(0,255,120,0.9)";
+    ctx.fillStyle = "rgba(0,255,120,0.08)";
+    ctx.beginPath();
+    ctx.roundRect(rx, ry, rw, rh, 18 * devicePixelRatio);
+    ctx.fill();
+    ctx.stroke();
 
-  const Lroi = avgLuma(r, null);
-  const Lbg  = avgLuma(b, r);      // fondo excluyendo el ROI central
-  const delta = Lroi - Lbg;        // señal útil
-
-  // baseline y sigma del delta (adaptativo)
-  baseline = baseline ? (baseline*0.985 + delta*0.015) : delta;
-
-  const dev = Math.abs(delta - baseline);
-  sigma = sigma ? (sigma*0.98 + dev*0.02) : dev;
-
-  const dotMs = Math.max(120, Number(dotInput.value) || 250);
-  const sens  = Math.max(0.8, Number(sensInput.value) || 1.8);
-
-  // umbrales con histéresis
-  const thOn  = baseline + sigma * sens;
-  const thOff = baseline + sigma * (sens * 0.55);
-
-  let nextOn = on;
-  if(!on && delta > thOn) nextOn = true;
-  else if(on && delta < thOff) nextOn = false;
-
-  elDval.textContent = `Δ: ${delta.toFixed(1)}  (bg ${Lbg.toFixed(0)})`;
-  elState.textContent = nextOn ? "ON detectado" : "OFF detectado";
-
-  updateState(nextOn, dotMs);
-
-  // cierres automáticos si se queda OFF
-  const now = performance.now();
-  if(!on){
-    const offDur = now - lastChange;
-    const LETTER_GAP_MIN = dotMs * 2.2;
-    const WORD_GAP_MIN   = dotMs * 5.5;
-    if(offDur >= WORD_GAP_MIN) commitWord();
-    else if(offDur >= LETTER_GAP_MIN) commitLetter();
+    // crosshair
+    ctx.strokeStyle = "rgba(0,255,120,0.35)";
+    ctx.lineWidth = 1.5 * devicePixelRatio;
+    ctx.beginPath();
+    ctx.moveTo(rx + rw/2, ry);
+    ctx.lineTo(rx + rw/2, ry + rh);
+    ctx.moveTo(rx, ry + rh/2);
+    ctx.lineTo(rx + rw, ry + rh/2);
+    ctx.stroke();
   }
-}
 
-btnClear.addEventListener('click', resetAll);
+  function getPointerPos(e) {
+    const rect = overlay.getBoundingClientRect();
+    const px = (e.clientX - rect.left) / rect.width;
+    const py = (e.clientY - rect.top) / rect.height;
+    return { x: px, y: py };
+  }
 
-btnStart.addEventListener('click', async ()=>{
-  stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode:{ ideal:"environment" }, width:{ideal:1280}, height:{ideal:720} },
-    audio:false
+  function isInsideROI(p) {
+    return p.x >= roi.x && p.x <= roi.x+roi.w && p.y >= roi.y && p.y <= roi.y+roi.h;
+  }
+
+  // allow dragging ROI (pointer events on stage, not canvas, because canvas pointer-events none)
+  const stage = document.getElementById("stage");
+  stage.addEventListener("pointerdown", (e) => {
+    if (!overlay.width) return;
+    const p = getPointerPos(e);
+    if (isInsideROI(p)) {
+      dragging = true;
+      dragOffset.x = p.x - roi.x;
+      dragOffset.y = p.y - roi.y;
+      stage.setPointerCapture(e.pointerId);
+    }
   });
-  video.srcObject = stream;
-  resetAll();
-  startOverlay.style.display = "none";
-});
+  stage.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const p = getPointerPos(e);
+    roi.x = clamp(p.x - dragOffset.x, 0, 1 - roi.w);
+    roi.y = clamp(p.y - dragOffset.y, 0, 1 - roi.h);
+  });
+  stage.addEventListener("pointerup", () => dragging = false);
+  stage.addEventListener("pointercancel", () => dragging = false);
 
-loop();
+  // --- Morse decoding state ---
+  let listening = false;
+  let lastOn = false;
+  let lastSwitchTs = 0;
+
+  let currentSymbols = ""; // ".-.-"
+  let decoded = "";
+
+  // brightness tracking
+  let baseline = 0;         // slow moving average (ambient)
+  let smooth = 0;           // faster moving average (signal)
+  let lastFrameTs = 0;
+
+  function resetDecoder() {
+    lastOn = false;
+    lastSwitchTs = performance.now();
+    currentSymbols = "";
+    symbolsEl.textContent = " ";
+    stateEl.textContent = "OFF";
+  }
+
+  function flushLetter() {
+    if (!currentSymbols) return;
+    const ch = MORSE[currentSymbols] ?? "�";
+    decoded += ch;
+    out.value = decoded;
+    currentSymbols = "";
+    symbolsEl.textContent = " ";
+  }
+
+  function pushSpace() {
+    // avoid double spaces
+    if (!decoded.endsWith(" ")) {
+      decoded += " ";
+      out.value = decoded;
+    }
+  }
+
+  function classifyOnDuration(ms, unit) {
+    // dot ~ 1u, dash ~ 3u. Use threshold around 2u.
+    return (ms < unit * 2.0) ? "." : "-";
+  }
+
+  function processTransition(now, isOn, unit) {
+    const dt = now - lastSwitchTs;
+    lastSwitchTs = now;
+
+    if (lastOn && !isOn) {
+      // ON -> OFF: we just finished a dot/dash
+      const sym = classifyOnDuration(dt, unit);
+      currentSymbols += sym;
+      symbolsEl.textContent = currentSymbols;
+    } else if (!lastOn && isOn) {
+      // OFF -> ON: we just finished a gap
+      // gap handling based on dt
+      if (dt >= unit * 6.2) {       // ~7u (word gap)
+        flushLetter();
+        pushSpace();
+      } else if (dt >= unit * 2.2) { // ~3u (letter gap)
+        flushLetter();
+      } else {
+        // ~1u intra-symbol gap -> do nothing
+      }
+    }
+    lastOn = isOn;
+    stateEl.textContent = isOn ? "ON" : "OFF";
+  }
+
+  function computeROILuminance() {
+    // draw current video frame to an offscreen canvas-like path:
+    // We'll use overlay ctx temporarily with drawImage into a small buffer region via getImageData on overlay.
+    // Trick: draw video to overlay (in memory), read ROI, then redraw overlay UI after.
+    const w = overlay.width, h = overlay.height;
+    if (!w || !h) return 0;
+
+    // draw video frame mirrored to match the displayed mirrored video
+    ctx.save();
+    ctx.setTransform(-1, 0, 0, 1, w, 0); // mirror X
+    ctx.drawImage(video, 0, 0, w, h);
+    ctx.restore();
+
+    const rx = Math.floor(roi.x * w);
+    const ry = Math.floor(roi.y * h);
+    const rw = Math.floor(roi.w * w);
+    const rh = Math.floor(roi.h * h);
+
+    const img = ctx.getImageData(rx, ry, rw, rh).data;
+
+    // mean luminance (fast)
+    let sum = 0;
+    // sample every N pixels for speed
+    const step = 16; // 4 channels * 4 pixels
+    for (let i = 0; i < img.length; i += step) {
+      const r = img[i], g = img[i+1], b = img[i+2];
+      // Rec. 709
+      sum += 0.2126*r + 0.7152*g + 0.0722*b;
+    }
+    const samples = Math.max(1, Math.floor(img.length / step));
+    const mean = sum / samples / 255; // 0..1
+
+    // after reading, restore overlay UI
+    drawOverlay();
+    return mean;
+  }
+
+  function tick(ts) {
+    if (!listening) return;
+
+    if (!lastFrameTs) lastFrameTs = ts;
+    const dt = ts - lastFrameTs;
+    lastFrameTs = ts;
+
+    const lum = computeROILuminance();
+
+    // Smooth and baseline
+    // baseline follows slowly, smooth follows faster
+    const aBaseline = 0.02;
+    const aSmooth = 0.20;
+    baseline = baseline + aBaseline * (lum - baseline);
+    smooth = smooth + aSmooth * (lum - smooth);
+
+    // sensitivity: higher => easier to trigger ON
+    const s = Number(sens.value); // 0..100
+    sensVal.textContent = String(s);
+
+    // dynamic thresholds around baseline
+    // delta needed grows when sensitivity is low
+    const delta = (1.0 - s/100) * 0.10 + 0.02; // ~0.02..0.12
+    const onTh  = baseline + delta;
+    const offTh = baseline + delta * 0.6; // hysteresis
+
+    const isOn = lastOn ? (smooth > offTh) : (smooth > onTh);
+
+    // UI meter
+    luxEl.textContent = smooth.toFixed(3);
+    barFill.style.width = (clamp(smooth,0,1)*100).toFixed(1) + "%";
+
+    const unit = Number(unitSel.value);
+
+    // transition detect
+    if (isOn !== lastOn) {
+      processTransition(performance.now(), isOn, unit);
+    } else {
+      // if we are OFF, check if a long silence means end of letter/word even without new ON
+      if (!isOn) {
+        const gap = performance.now() - lastSwitchTs;
+        if (currentSymbols && gap >= unit * 2.8) { // close to letter gap
+          // flush once, then wait; avoid repeated flush
+          flushLetter();
+          lastSwitchTs = performance.now();
+        }
+        if (gap >= unit * 7.5) {
+          pushSpace();
+          lastSwitchTs = performance.now();
+        }
+      }
+    }
+
+    requestAnimationFrame(tick);
+  }
+
+  // --- Camera setup ---
+  let stream = null;
+
+  async function startCamera() {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: "environment", // móvil: cámara trasera
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      },
+      audio: false
+    });
+    video.srcObject = stream;
+
+    await new Promise(res => video.onloadedmetadata = res);
+    video.play();
+
+    overlaySizeToVideo();
+    drawOverlay();
+
+    btnListen.disabled = false;
+    btnClear.disabled = false;
+  }
+
+  function stopCamera() {
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    video.srcObject = null;
+  }
+
+  // --- Events ---
+  btnStart.addEventListener("click", async () => {
+    try {
+      btnStart.disabled = true;
+      btnStart.textContent = "Cámara activa";
+      await startCamera();
+    } catch (e) {
+      console.error(e);
+      btnStart.disabled = false;
+      btnStart.textContent = "Iniciar cámara";
+      alert("No se pudo acceder a la cámara. Abre esto en https o localhost y acepta permisos.");
+    }
+  });
+
+  btnListen.addEventListener("click", () => {
+    listening = !listening;
+    btnListen.textContent = listening ? "Parar" : "Escuchar Morse";
+    if (listening) {
+      // reset tracking
+      baseline = 0;
+      smooth = 0;
+      lastFrameTs = 0;
+      resetDecoder();
+      requestAnimationFrame(tick);
+    }
+  });
+
+  btnClear.addEventListener("click", () => {
+    decoded = "";
+    out.value = "";
+    resetDecoder();
+  });
+
+  // keep overlay in sync on resize
+  window.addEventListener("resize", () => {
+    if (!video.srcObject) return;
+    overlaySizeToVideo();
+    drawOverlay();
+  });
+})();
 </script>
 </body>
 </html>
