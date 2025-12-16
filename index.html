@@ -1,13 +1,16 @@
 <!doctype html>
 <html lang="es">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Morse Decoder</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
-  canvas{position:fixed;inset:0}
+  /* Canvas de lectura oculto */
+  #cv{position:fixed;left:-99999px;top:0;width:1px;height:1px;opacity:0}
+  /* Canvas UI encima para el cuadrado y drag */
+  #ui{position:fixed;inset:0;touch-action:none}
   #out{
     position:fixed;left:12px;right:12px;bottom:12px;
     padding:10px 12px;
@@ -15,7 +18,9 @@
     border-radius:14px;
     background:rgba(0,0,0,.6);
     color:#7CFF9D;
-    font:20px/1.3 system-ui;
+    font:20px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    white-space:pre-wrap;
+    user-select:text;
   }
 </style>
 </head>
@@ -28,127 +33,219 @@
 
 <script>
 (() => {
+  // === CUADRADO EXACTO Y PEQUEÑO ===
+  const ROI_SIZE_PX = 36; // prueba 28 / 36 / 48
 
-const ROI_SIZE = 32;
+  // === Tu tabla Morse (igual que emisor) ===
+  const MORSE = {
+    ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
+    "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
+    "--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
+    "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
+    "-.--":"Y","--..":"Z",
+    "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
+    ".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
+  };
 
-const MORSE = {
-".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
-"--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
-"--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
-"...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
-"-.--":"Y","--..":"Z",
-"-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
-".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
-};
+  const video = document.getElementById("video");
+  const cv = document.getElementById("cv");
+  const ui = document.getElementById("ui");
+  const ctxV = cv.getContext("2d", { willReadFrequently: true });
+  const ctxU = ui.getContext("2d");
+  const out = document.getElementById("out");
 
-const video = document.getElementById("video");
-const cv = document.getElementById("cv");
-const ui = document.getElementById("ui");
-const ctxV = cv.getContext("2d",{willReadFrequently:true});
-const ctxU = ui.getContext("2d");
-const out = document.getElementById("out");
+  // ROI en píxeles reales (device pixels)
+  let roi = { x: 60, y: 60 };
+  let dragging = false, dx = 0, dy = 0;
 
-function resize(){
-  const w=innerWidth*devicePixelRatio;
-  const h=innerHeight*devicePixelRatio;
-  cv.width=ui.width=w;
-  cv.height=ui.height=h;
-}
-addEventListener("resize",resize);
-resize();
+  function dpr(){ return devicePixelRatio || 1; }
+  function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
 
-/* ROI */
-let roi={x:40,y:40};
-let drag=false,dx=0,dy=0;
+  function resize(){
+    const W = Math.floor(innerWidth * dpr());
+    const H = Math.floor(innerHeight * dpr());
+    cv.width = W; cv.height = H;
+    ui.width = W; ui.height = H;
 
-ui.addEventListener("pointerdown",e=>{
-  const x=e.clientX*devicePixelRatio;
-  const y=e.clientY*devicePixelRatio;
-  if(x>=roi.x&&x<=roi.x+ROI_SIZE&&y>=roi.y&&y<=roi.y+ROI_SIZE){
-    drag=true; dx=x-roi.x; dy=y-roi.y;
-    ui.setPointerCapture(e.pointerId);
+    // mantener ROI dentro
+    const S = Math.floor(ROI_SIZE_PX * dpr());
+    roi.x = clamp(roi.x, 0, W - S);
+    roi.y = clamp(roi.y, 0, H - S);
   }
-});
-ui.addEventListener("pointermove",e=>{
-  if(!drag)return;
-  roi.x=e.clientX*devicePixelRatio-dx;
-  roi.y=e.clientY*devicePixelRatio-dy;
-});
-ui.addEventListener("pointerup",()=>drag=false);
-ui.addEventListener("pointercancel",()=>drag=false);
+  addEventListener("resize", resize);
 
-/* LUMINANCIA */
-function luminance(){
-  ctxV.drawImage(video,0,0,cv.width,cv.height);
-  const d=ctxV.getImageData(roi.x,roi.y,ROI_SIZE,ROI_SIZE).data;
-  let s=0;
-  for(let i=0;i<d.length;i+=16)
-    s+=0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2];
-  return (s/(d.length/16))/255;
-}
+  function drawSquare(){
+    const W = ui.width, H = ui.height;
+    const S = Math.floor(ROI_SIZE_PX * dpr());
 
-/* DECODER ROBUSTO */
-let base=0,smooth=0,lastOn=false,lastT=performance.now();
-let current="", text="";
-let onDurations=[];
-
-function flush(){
-  if(current){
-    text+=MORSE[current]||"�";
-    out.textContent=text;
-    current="";
+    ctxU.clearRect(0,0,W,H);
+    ctxU.strokeStyle = "rgba(0,255,120,.92)";
+    ctxU.lineWidth = Math.max(2, Math.floor(2 * dpr()));
+    ctxU.strokeRect(roi.x, roi.y, S, S);
   }
-}
 
-function classify(dt){
-  if(onDurations.length<2) return ".";
-  const min=Math.min(...onDurations);
-  return dt < min*2.2 ? "." : "-";
-}
-
-function loop(){
-  const l=luminance();
-  base+=0.02*(l-base);
-  smooth+=0.3*(l-smooth);
-
-  const on=lastOn ? smooth>base+0.03 : smooth>base+0.06;
-  const now=performance.now();
-
-  if(on!==lastOn){
-    const dt=now-lastT;
-    lastT=now;
-
-    if(lastOn && !on){
-      onDurations.push(dt);
-      if(onDurations.length>10) onDurations.shift();
-      current+=classify(dt);
+  // Drag robusto (sobre ui)
+  ui.addEventListener("pointerdown", (e) => {
+    const S = Math.floor(ROI_SIZE_PX * dpr());
+    const x = e.clientX * dpr();
+    const y = e.clientY * dpr();
+    if (x >= roi.x && x <= roi.x + S && y >= roi.y && y <= roi.y + S) {
+      dragging = true;
+      dx = x - roi.x;
+      dy = y - roi.y;
+      ui.setPointerCapture(e.pointerId);
     }
+  });
 
-    if(!lastOn && on){
-      if(dt>Math.max(...onDurations)*4){
-        flush();
-        text+=" ";
-        out.textContent=text;
-      } else if(dt>Math.max(...onDurations)*2){
-        flush();
+  ui.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const S = Math.floor(ROI_SIZE_PX * dpr());
+    const W = ui.width, H = ui.height;
+    const x = e.clientX * dpr();
+    const y = e.clientY * dpr();
+    roi.x = clamp(x - dx, 0, W - S);
+    roi.y = clamp(y - dy, 0, H - S);
+  });
+
+  ui.addEventListener("pointerup", () => dragging = false);
+  ui.addEventListener("pointercancel", () => dragging = false);
+
+  // Luminancia media del cuadrado (NO tocamos el UI canvas)
+  function luminance(){
+    const W = cv.width, H = cv.height;
+    const S = Math.floor(ROI_SIZE_PX * dpr());
+
+    ctxV.drawImage(video, 0, 0, W, H);
+    const img = ctxV.getImageData(roi.x, roi.y, S, S).data;
+
+    let sum = 0;
+    const step = 16; // muestreo rápido
+    for (let i = 0; i < img.length; i += step) {
+      const r = img[i], g = img[i+1], b = img[i+2];
+      sum += 0.2126*r + 0.7152*g + 0.0722*b;
+    }
+    const n = Math.max(1, Math.floor(img.length / step));
+    return (sum / n) / 255; // 0..1
+  }
+
+  // ===== Decodificador alineado con tu emisor =====
+  // Emisor:
+  // dot=1u ON, dash=3u ON, intra=1u OFF, letter=3u OFF (si next no es espacio), word=7u OFF
+  //
+  // Problema real: cámara+pantalla deforman tiempos -> estimamos "u" de lo que vemos.
+  let baseline = 0, smooth = 0;
+  let lastOn = false;
+  let lastT = performance.now();
+  let current = "";
+  let text = "";
+
+  // buffers de duraciones para estimar unidad
+  const onDur = [];
+  const offDur = [];
+
+  function pushBuf(buf, v, max=24){
+    buf.push(v);
+    if (buf.length > max) buf.shift();
+  }
+
+  function robustUnit(){
+    // unidad aproximada = mediana de los "cortos" (ON y OFF)
+    const a = [...onDur, ...offDur].filter(x => x > 10).sort((p,q)=>p-q);
+    if (a.length < 6) return null;
+    const short = a.slice(0, Math.min(10, a.length)); // los más cortos suelen ser ~1u
+    const mid = short[Math.floor(short.length/2)];
+    return mid;
+  }
+
+  function flushLetter(){
+    if (!current) return;
+    text += (MORSE[current] ?? "�");
+    out.textContent = text;
+    current = "";
+  }
+
+  function addSpace(){
+    if (!text.endsWith(" ")) {
+      text += " ";
+      out.textContent = text;
+    }
+  }
+
+  function loop(){
+    const lum = luminance();
+
+    // filtro y umbral dinámico con histéresis
+    baseline += 0.02 * (lum - baseline);
+    smooth   += 0.25 * (lum - smooth);
+
+    const onTh  = baseline + 0.06;
+    const offTh = baseline + 0.04;
+    const isOn = lastOn ? (smooth > offTh) : (smooth > onTh);
+
+    const now = performance.now();
+
+    if (isOn !== lastOn) {
+      const dt = now - lastT;
+      lastT = now;
+
+      if (lastOn && !isOn) {
+        // ON -> OFF : terminó símbolo
+        pushBuf(onDur, dt);
+        const u = robustUnit();
+
+        // si aún no hay u, asumimos punto (mejor que nada)
+        if (!u) current += ".";
+        else current += (dt < 2.2 * u) ? "." : "-";
+      }
+
+      if (!lastOn && isOn) {
+        // OFF -> ON : terminó silencio
+        pushBuf(offDur, dt);
+        const u = robustUnit();
+
+        // Cierre EXACTO como emisor: por longitud del OFF
+        if (u) {
+          if (dt >= 6.2 * u) { // ~7u
+            flushLetter();
+            addSpace();
+          } else if (dt >= 2.2 * u) { // ~3u
+            flushLetter();
+          }
+        }
+      }
+
+      lastOn = isOn;
+    } else {
+      // Si se queda OFF mucho rato (silencio final), cerramos lo pendiente 1 vez
+      if (!isOn && current) {
+        const dt = now - lastT;
+        const u = robustUnit();
+        if (u && dt >= 2.2 * u) {
+          flushLetter();
+          // no actualizamos lastT: queremos permitir también detectar word-gap más tarde si llega ON
+        }
       }
     }
-    lastOn=on;
+
+    drawSquare();
+    requestAnimationFrame(loop);
   }
 
-  ctxU.clearRect(0,0,ui.width,ui.height);
-  ctxU.strokeStyle="rgba(0,255,120,.9)";
-  ctxU.lineWidth=3*devicePixelRatio;
-  ctxU.strokeRect(roi.x,roi.y,ROI_SIZE,ROI_SIZE);
-
-  requestAnimationFrame(loop);
-}
-
-navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
-.then(s=>{
-  video.srcObject=s;
-  video.onloadedmetadata=()=>{video.play();loop();}
-});
+  // Start
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false
+  }).then(stream => {
+    video.srcObject = stream;
+    video.onloadedmetadata = () => {
+      video.play();
+      resize();
+      drawSquare();
+      requestAnimationFrame(loop);
+    };
+  }).catch(() => {
+    out.textContent = "No se pudo acceder a la cámara (usa https o localhost).";
+  });
 
 })();
 </script>
