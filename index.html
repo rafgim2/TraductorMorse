@@ -3,58 +3,29 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>Morse Reader (Small ROI + Live Scramble)</title>
+  <title>Morse Reader (Square ROI + Live Scramble)</title>
 
   <style>
-    html,body{
-      margin:0;height:100%;background:#000;overflow:hidden;
-      font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;
-      color:#eaeaea;
-    }
+    html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#eaeaea;}
     .wrap{position:relative;width:100vw;height:100vh;}
     video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
     canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
 
-    .start{
-      position:absolute;inset:0;
-      display:flex;align-items:center;justify-content:center;
-      background:rgba(0,0,0,.55);
-      text-align:center;padding:24px;
-    }
-    .start button{
-      background:#1f1f1f;border:1px solid #3a3a3a;
-      color:#eaeaea;border-radius:14px;
-      padding:12px 16px;font-size:16px;cursor:pointer;
-    }
+    .start{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);text-align:center;padding:24px;}
+    .start button{background:#1f1f1f;border:1px solid #3a3a3a;color:#eaeaea;border-radius:14px;padding:12px 16px;font-size:16px;cursor:pointer;}
     .start p{margin:10px 0 0;opacity:.8;font-size:13px;line-height:1.35}
 
     .hud{
       position:absolute;left:12px;right:12px;bottom:12px;
-      background:rgba(0,0,0,.55);
-      border:1px solid rgba(255,255,255,.15);
-      border-radius:16px;padding:10px 12px;
-      backdrop-filter:blur(6px);
+      background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.15);
+      border-radius:16px;padding:10px 12px;backdrop-filter:blur(6px);
     }
     .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
-    .pill{
-      padding:3px 10px;border-radius:999px;
-      border:1px solid rgba(255,255,255,.15);
-      background:rgba(0,0,0,.35);
-      font-size:13px;opacity:.9
-    }
+    .pill{padding:3px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.35);font-size:13px;opacity:.9}
     .mono{font-family:ui-monospace,Menlo,Consolas,monospace;}
-    .big{
-      font-size:24px;white-space:pre-wrap;
-      word-break:break-word;line-height:1.25
-    }
-    button.small{
-      background:#222;border:1px solid #333;color:#eaeaea;
-      border-radius:12px;padding:8px 10px;font-size:14px;cursor:pointer;
-    }
-    input.small{
-      width:72px;background:#111;border:1px solid #333;color:#eaeaea;
-      border-radius:12px;padding:8px 10px;font-size:14px;
-    }
+    .big{font-size:24px;white-space:pre-wrap;word-break:break-word;line-height:1.25}
+    button.small{background:#222;border:1px solid #333;color:#eaeaea;border-radius:12px;padding:8px 10px;font-size:14px;cursor:pointer;}
+    input.small{width:72px;background:#111;border:1px solid #333;color:#eaeaea;border-radius:12px;padding:8px 10px;font-size:14px;}
     .sub{opacity:.75;font-size:13px}
   </style>
 </head>
@@ -82,18 +53,17 @@
       <span class="pill mono">Sens: <input id="sens" class="small" value="1.8"></span>
       <button class="small" id="btnClear">Borrar</button>
     </div>
-    <div style="margin-top:8px" class="mono sub">
-      Secuencia: <span id="seq">—</span>
-    </div>
+    <div style="margin-top:8px" class="mono sub">Secuencia: <span id="seq">—</span></div>
     <div style="margin-top:8px" class="mono big" id="out">(mensaje)</div>
   </div>
 </div>
 
 <script>
-/* ===== ROI pequeño ===== */
+/* ===== ROI CUADRADO =====
+   sizePct es el % del lado respecto al lado menor de la pantalla.
+*/
 const ROI = {
-  wPct: 0.22,
-  hPct: 0.14,
+  sizePct: 0.18,     // <-- más pequeño/grande cambiando esto (0.12–0.25 típico)
   xCenterPct: 0.80,
   yCenterPct: 0.20
 };
@@ -103,13 +73,12 @@ const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789?/#@$%&*+-";
 const SCRAMBLE_HOLD_MS = 2000;
 const SCRAMBLE_STEP_MS = 35;
 
-/* ===== Morse ===== */
+/* ===== Morse map ===== */
 const MORSE_TO_CHAR = {
   ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F","--.":"G","....":"H","..":"I",
   ".---":"J","-.-":"K",".-..":"L","--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
   "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X","-.--":"Y","--..":"Z",
-  "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",".....":"5","-....":"6",
-  "--...":"7","---..":"8","----.":"9"
+  "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
 };
 
 const video = document.getElementById('video');
@@ -134,30 +103,31 @@ const fctx = frame.getContext('2d', { willReadFrequently:true });
 let stream = null;
 
 function resize(){
-  ui.width = innerWidth;
-  ui.height = innerHeight;
-  frame.width = innerWidth;
-  frame.height = innerHeight;
+  ui.width = innerWidth; ui.height = innerHeight;
+  frame.width = innerWidth; frame.height = innerHeight;
 }
 addEventListener('resize', resize);
 resize();
 
 function roiRect(){
-  const w = Math.floor(ui.width * ROI.wPct);
-  const h = Math.floor(ui.height * ROI.hPct);
-  const x = Math.floor(ui.width * ROI.xCenterPct - w/2);
-  const y = Math.floor(ui.height * ROI.yCenterPct - h/2);
-  return { x:Math.max(0,x), y:Math.max(0,y), w, h };
+  const side = Math.floor(Math.min(ui.width, ui.height) * ROI.sizePct);
+  const x = Math.floor(ui.width * ROI.xCenterPct - side/2);
+  const y = Math.floor(ui.height * ROI.yCenterPct - side/2);
+  return {
+    x: Math.max(0, x),
+    y: Math.max(0, y),
+    w: Math.min(side, ui.width),
+    h: Math.min(side, ui.height)
+  };
 }
 
 function bgRect(){
   const r = roiRect();
-  const padX = Math.floor(r.w * 0.25);
-  const padY = Math.floor(r.h * 0.25);
-  const x = Math.max(0, r.x - padX);
-  const y = Math.max(0, r.y - padY);
-  const w = Math.min(ui.width - x, r.w + 2*padX);
-  const h = Math.min(ui.height - y, r.h + 2*padY);
+  const pad = Math.floor(r.w * 0.7); // anillo bastante grande para fondo
+  const x = Math.max(0, r.x - pad);
+  const y = Math.max(0, r.y - pad);
+  const w = Math.min(ui.width - x, r.w + 2*pad);
+  const h = Math.min(ui.height - y, r.h + 2*pad);
   return { x, y, w, h };
 }
 
@@ -181,43 +151,53 @@ function drawCover(){
   return true;
 }
 
-function avgLuma(rect, skip=null){
+function avgLuma(rect, skipInnerRect=null){
   const img = fctx.getImageData(rect.x, rect.y, rect.w, rect.h);
   const d = img.data;
   let sum=0, n=0;
   const step = 24;
 
-  for(let i=0;i<d.length;i+=step){
-    const px = ((i/4) % rect.w)|0;
-    const py = ((i/4 / rect.w))|0;
-    const sx = rect.x + px;
-    const sy = rect.y + py;
+  const ex = skipInnerRect;
 
-    if(skip &&
-       sx>=skip.x && sx<skip.x+skip.w &&
-       sy>=skip.y && sy<skip.y+skip.h) continue;
+  for(let i=0;i<d.length;i+=step){
+    const px = ((i/4) % rect.w) | 0;
+    const py = ((i/4 / rect.w)) | 0;
+
+    if (ex){
+      const sx = rect.x + px;
+      const sy = rect.y + py;
+      if (sx >= ex.x && sx < ex.x+ex.w && sy >= ex.y && sy < ex.y+ex.h) continue;
+    }
 
     const r=d[i], g=d[i+1], b=d[i+2];
-    sum += 0.2126*r + 0.7152*g + 0.0722*b;
-    n++;
+    const lum = 0.2126*r + 0.7152*g + 0.0722*b;
+    sum += lum; n++;
   }
   return n ? sum/n : 0;
 }
 
 /* ===== Decoder ===== */
-let baseline=0, sigma=0, on=false;
+let baseline = 0;
+let sigma = 0;
+let on = false;
 let lastChange = performance.now();
-let currentSymbol="", seqVisible="";
-let stableText="", pending=[];
-let scrambling=false;
-let lastCommitAt=0;
+
+let currentSymbol = "";
+let seqVisible = "";
+let stableText = "";
+let pending = [];
+let scrambling = false;
+
+/* anti-repetición de commits (clave para el cierre automático OFF) */
+let lastCommitAt = 0;
+let lastAutoCloseType = ""; // "letter" | "word" | ""
 
 function randChar(){
   return SCRAMBLE_CHARS[Math.floor(Math.random()*SCRAMBLE_CHARS.length)];
 }
 
 function enqueueChars(s){
-  for(const c of s) pending.push(c);
+  for(const ch of s) pending.push(ch);
   if(!scrambling) runScramble();
 }
 
@@ -225,7 +205,7 @@ async function runScramble(){
   scrambling = true;
   while(pending.length){
     const ch = pending.shift();
-    if(ch===" "){
+    if (ch === " "){
       stableText += " ";
       elOut.textContent = stableText || "(mensaje)";
       continue;
@@ -241,96 +221,147 @@ async function runScramble(){
   scrambling = false;
 }
 
-function addSymbol(s){
-  currentSymbol += s;
-  seqVisible += s;
+function addSymbol(sym){
+  currentSymbol += sym;
+  seqVisible += sym;
   elSeq.textContent = seqVisible || "—";
 }
 
 function commitLetter(){
   if(!currentSymbol) return;
+
   const now = performance.now();
-  if(now - lastCommitAt < 120) return;
+  if (now - lastCommitAt < 150) return;
   lastCommitAt = now;
-  enqueueChars(MORSE_TO_CHAR[currentSymbol] || "�");
+
+  const ch = MORSE_TO_CHAR[currentSymbol] || "�";
+  enqueueChars(ch);
   currentSymbol = "";
+  lastAutoCloseType = "letter";
 }
 
 function commitWord(){
   const now = performance.now();
-  if(now - lastCommitAt < 120) return;
+  if (now - lastCommitAt < 150) return;
   lastCommitAt = now;
+
   commitLetter();
   enqueueChars(" ");
+  lastAutoCloseType = "word";
 }
 
 function resetAll(){
-  baseline=0; sigma=0; on=false;
-  lastChange=performance.now();
-  currentSymbol=""; seqVisible="";
-  stableText=""; pending=[];
-  scrambling=false; lastCommitAt=0;
-  elSeq.textContent="—";
-  elOut.textContent="(mensaje)";
+  baseline = 0; sigma = 0;
+  on = false;
+  lastChange = performance.now();
+  currentSymbol = "";
+  seqVisible = "";
+  elSeq.textContent = "—";
+  stableText = "";
+  pending = [];
+  scrambling = false;
+  elOut.textContent = "(mensaje)";
+  lastCommitAt = 0;
+  lastAutoCloseType = "";
 }
 
 function updateState(nextOn, dotMs){
   const now = performance.now();
-  if(nextOn===on) return;
-  const dt = now-lastChange;
+  if(nextOn === on) return;
+
+  const dt = now - lastChange;
+
+  const DOT_MAX = dotMs * 2.0;
+  const DASH_MIN = dotMs * 2.0;
+  const LETTER_GAP_MIN = dotMs * 2.2;
+  const WORD_GAP_MIN   = dotMs * 5.5;
 
   if(on){
-    if(dt<=dotMs*2) addSymbol(".");
-    else addSymbol("-");
-  }else{
-    if(dt>=dotMs*5.5) commitWord();
-    else if(dt>=dotMs*2.2) commitLetter();
+    // ON -> OFF: duración pulso
+    if(dt <= DOT_MAX) addSymbol(".");
+    else if(dt >= DASH_MIN) addSymbol("-");
+    else addSymbol(".");
+  } else {
+    // OFF -> ON: duración silencio (si venimos de un gap grande)
+    if(dt >= WORD_GAP_MIN){
+      commitWord();
+      seqVisible += " / ";
+      elSeq.textContent = seqVisible || "—";
+    } else if(dt >= LETTER_GAP_MIN){
+      commitLetter();
+      seqVisible += " ";
+      elSeq.textContent = seqVisible || "—";
+    }
   }
-  lastChange=now;
-  on=nextOn;
+
+  lastChange = now;
+  on = nextOn;
+
+  // al volver a ON, permitimos cierres automáticos nuevos
+  if(on) lastAutoCloseType = "";
 }
 
 function loop(){
   requestAnimationFrame(loop);
   drawUI();
-  if(!stream || !drawCover()) return;
+  if(!stream) return;
+  if(!drawCover()) return;
 
-  const r=roiRect(), b=bgRect();
-  const Lroi=avgLuma(r,null);
-  const Lbg=avgLuma(b,r);
-  const delta=Lroi-Lbg;
+  const r = roiRect();
+  const b = bgRect();
 
-  baseline = baseline ? baseline*0.985 + delta*0.015 : delta;
-  const dev = Math.abs(delta-baseline);
-  sigma = sigma ? sigma*0.98 + dev*0.02 : dev;
+  const Lroi = avgLuma(r, null);
+  const Lbg  = avgLuma(b, r);
+  const delta = Lroi - Lbg;
 
-  const dotMs=Math.max(120,Number(dotInput.value)||250);
-  const sens=Math.max(0.8,Number(sensInput.value)||1.8);
+  baseline = baseline ? (baseline*0.985 + delta*0.015) : delta;
 
-  const thOn = baseline + sigma*sens;
-  const thOff= baseline + sigma*(sens*0.55);
+  const dev = Math.abs(delta - baseline);
+  sigma = sigma ? (sigma*0.98 + dev*0.02) : dev;
 
-  let nextOn=on;
-  if(!on && delta>thOn) nextOn=true;
-  else if(on && delta<thOff) nextOn=false;
+  const dotMs = Math.max(120, Number(dotInput.value) || 250);
+  const sens  = Math.max(0.8, Number(sensInput.value) || 1.8);
 
-  elState.textContent = nextOn?"ON detectado":"OFF detectado";
-  elDval.textContent = `Δ: ${delta.toFixed(1)} (bg ${Lbg.toFixed(0)})`;
+  const thOn  = baseline + sigma * sens;
+  const thOff = baseline + sigma * (sens * 0.55);
 
-  updateState(nextOn,dotMs);
+  let nextOn = on;
+  if(!on && delta > thOn) nextOn = true;
+  else if(on && delta < thOff) nextOn = false;
+
+  elDval.textContent = `Δ: ${delta.toFixed(1)}  (bg ${Lbg.toFixed(0)})`;
+  elState.textContent = nextOn ? "ON detectado" : "OFF detectado";
+
+  updateState(nextOn, dotMs);
+
+  /* ===== CIERRE AUTOMÁTICO SI SE QUEDA OFF =====
+     Esto es lo que te faltaba y por eso no escribía.
+  */
+  const now = performance.now();
+  if(!on){
+    const offDur = now - lastChange;
+    const LETTER_GAP_MIN = dotMs * 2.2;
+    const WORD_GAP_MIN   = dotMs * 5.5;
+
+    if(offDur >= WORD_GAP_MIN && lastAutoCloseType !== "word"){
+      commitWord();
+    } else if(offDur >= LETTER_GAP_MIN && lastAutoCloseType !== "letter"){
+      commitLetter();
+    }
+  }
 }
 
-btnClear.onclick = resetAll;
+btnClear.addEventListener('click', resetAll);
 
-btnStart.onclick = async ()=>{
+btnStart.addEventListener('click', async ()=>{
   stream = await navigator.mediaDevices.getUserMedia({
-    video:{facingMode:{ideal:"environment"},width:{ideal:1280},height:{ideal:720}},
+    video: { facingMode:{ ideal:"environment" }, width:{ideal:1280}, height:{ideal:720} },
     audio:false
   });
   video.srcObject = stream;
   resetAll();
-  startOverlay.style.display="none";
-};
+  startOverlay.style.display = "none";
+});
 
 loop();
 </script>
