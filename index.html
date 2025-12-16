@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (robusto start)</title>
+<title>Morse Decoder (wait signal)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -21,29 +21,27 @@
 </style>
 </head>
 <body>
+
 <video id="v" autoplay playsinline muted></video>
 <canvas id="ui"></canvas>
 <div id="out"></div>
 
 <script>
 (() => {
-  // UI
-  const ROI_DRAW = 24;       // cuadrado visible
-  const ROI_READ = 72;       // zona real analizada (más fácil)
-  const SAMPLE_STEP = 4;     // rendimiento
-  const K_CONTRAST = 0.85;   // score = mean + K*contrast
+  const ROI_DRAW = 24;
+  const ROI_READ = 64;
+  const SAMPLE_STEP = 4;
+  const K_CONTRAST = 0.85;
 
-  // START detection (robusto)
-  const START_WINDOW = 45;   // ~0.75s a 60fps / ~1.5s a 30fps
-  const START_K = 8.0;       // sensibilidad (sube si engancha con ruido, baja si tarda)
-  const START_N = 4;         // frames consecutivos por encima del umbral
+  // “Enganche” de señal
+  const START_ON_FRAMES = 8;   // cuántos frames seguidos ON para considerar que empezó
+  const START_DELTA = 18;      // cuánto debe subir el score sobre baseline para ser ON (aprox)
 
-  // Morse
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
     "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
     "--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
-    "...":"S","-":"T","..":"U","...-":"V",".--":"W","-..":"X",
+    "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
     "-.--":"Y","--..":"Z",
     "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
     ".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
@@ -55,7 +53,7 @@
   const out = document.getElementById("out");
 
   const cv = document.createElement("canvas");
-  const ctxV = cv.getContext("2d", { willReadFrequently:true });
+  const ctxV = cv.getContext("2d",{willReadFrequently:true});
 
   function resize(){
     ui.width = cv.width = innerWidth;
@@ -64,23 +62,22 @@
   addEventListener("resize", resize);
   resize();
 
-  // ROI drag
+  // ROI drag (dibujado pequeño)
   let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
-  ui.addEventListener("pointerdown", e=>{
+  ui.addEventListener("pointerdown",e=>{
     if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI_DRAW &&
        e.clientY>=roi.y&&e.clientY<=roi.y+ROI_DRAW){
       dragging=true; dx=e.clientX-roi.x; dy=e.clientY-roi.y;
       ui.setPointerCapture(e.pointerId);
     }
   });
-  ui.addEventListener("pointermove", e=>{
+  ui.addEventListener("pointermove",e=>{
     if(!dragging) return;
     roi.x=e.clientX-dx; roi.y=e.clientY-dy;
   });
-  ui.addEventListener("pointerup", ()=>dragging=false);
-  ui.addEventListener("pointercancel", ()=>dragging=false);
+  ui.addEventListener("pointerup",()=>dragging=false);
+  ui.addEventListener("pointercancel",()=>dragging=false);
 
-  // draw cover
   function drawCover(){
     const W=cv.width,H=cv.height;
     const vw=v.videoWidth,vh=v.videoHeight;
@@ -92,7 +89,6 @@
     return true;
   }
 
-  // score robusto: mean + K*contrast (p90-p10)
   function readScore(){
     if(!drawCover()) return null;
 
@@ -123,53 +119,45 @@
 
     let acc=0;
     const p10T=count*0.10, p90T=count*0.90;
-    let p10=0, p90=255;
-
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){ p10=bi<<2; break; } }
+    let p10=0,p90=255;
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){p10=bi<<2; break;} }
     acc=0;
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){ p90=bi<<2; break; } }
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){p90=bi<<2; break;} }
 
     const contrast = Math.max(0, p90-p10);
     return mean + K_CONTRAST*contrast;
   }
 
-  // util robusto: mediana y MAD
-  function median(arr){
-    const a=[...arr].sort((x,y)=>x-y);
-    return a[Math.floor(a.length/2)];
-  }
-  function mad(arr, med){
-    const dev=arr.map(v=>Math.abs(v-med));
-    return median(dev) || 1; // evita 0
-  }
+  // ===== Estado global =====
+  let WAIT_SIGNAL = true;
+  let baseline = null;
+  let startOnCount = 0;
 
-  // ===== Estado START =====
-  let waitingStart = true;
-  const scoreWin = [];
-  let aboveCount = 0;
-
-  // ===== Decoder por frames (igual que lo que ya te iba bien) =====
+  // Decoder state
   let offLevel=null,onLevel=null, stableOn=false;
   let onF=0, offF=0, current="", text="", letterClosed=false;
-
   const dots=[];
+
+  let ready=false, lastU=null, stableUCount=0;
+  let pendingWordGap=false, armed=false;
+
+  function resetSession(keepLearning=true){
+    current=""; text=""; out.textContent="";
+    letterClosed=false;
+    onF=0; offF=0; stableOn=false;
+    pendingWordGap=false; armed=false;
+
+    if(!keepLearning){
+      dots.length=0;
+      ready=false; lastU=null; stableUCount=0;
+    }
+  }
+
   function pushDot(n){ dots.push(n); if(dots.length>30) dots.shift(); }
   function dotUnit(){
     if(dots.length<8) return null;
     const s=[...dots].sort((a,b)=>a-b);
     return s[Math.floor(s.length/2)];
-  }
-
-  let ready=false, lastU=null, stableUCount=0;
-  let pendingWordGap=false, armed=false;
-
-  function resetAll(){
-    // reseteo completo para empezar “desde el principio” siempre
-    offLevel=null; onLevel=null; stableOn=false;
-    onF=0; offF=0; current=""; letterClosed=false;
-    dots.length=0; ready=false; lastU=null; stableUCount=0;
-    pendingWordGap=false; armed=false;
-    text=""; out.textContent="";
   }
 
   function updateReady(u){
@@ -188,14 +176,13 @@
     if(!current) return;
     if(!ready || !armed){ current=""; return; }
     text += (MORSE[current] ?? "�");
-    out.textContent = text;
+    out.textContent=text;
     current="";
   }
 
   function addSpace(){
     if(!ready) return;
     if(!armed){
-      // este es el separador entre preámbulo y mensaje real
       armed=true;
       pendingWordGap=false;
       text=""; out.textContent="";
@@ -251,14 +238,8 @@
     updateReady(u);
 
     if(!stableOn){
-      // fin de sesión: reset para la siguiente emisión (silencio final)
-      if((u && offF>=12*u) || (!u && offF>=140)){
-        resetAll();
-        waitingStart = true; // volvemos a esperar señal limpia
-        scoreWin.length = 0;
-        aboveCount = 0;
-        return;
-      }
+      if(u && offF>=12*u){ resetSession(true); } // fin sesión
+      if(!u && offF>=140){ resetSession(true); }
 
       if(u){
         if(current && offF>=1.8*u && !letterClosed){ flush(); letterClosed=true; }
@@ -282,38 +263,34 @@
     ctxU.lineWidth=2;
     ctxU.strokeRect(roi.x,roi.y,ROI_DRAW,ROI_DRAW);
 
-    // ventana de scores para START robusto
-    scoreWin.push(score);
-    if(scoreWin.length > START_WINDOW) scoreWin.shift();
+    // ===== WAIT_SIGNAL: no aprender ni decodificar hasta ver ON real =====
+    if(WAIT_SIGNAL){
+      if(baseline==null) baseline=score;
+      baseline = baseline + 0.05*(score-baseline); // baseline OFF
 
-    if(waitingStart){
-      if(scoreWin.length >= Math.min(START_WINDOW, 20)){
-        const med = median(scoreWin);
-        const m = mad(scoreWin, med);
-        const thr = med + START_K * m;
+      if(score > baseline + START_DELTA) startOnCount++;
+      else startOnCount = 0;
 
-        if(score > thr) aboveCount++;
-        else aboveCount = 0;
-
-        if(aboveCount >= START_N){
-          // START detectado: reseteo completo y comienzo decoder YA
-          resetAll();
-          waitingStart = false;
-          aboveCount = 0;
-          scoreWin.length = 0; // reinicia ventana para que no arrastre el pasado
-        }
+      if(startOnCount >= START_ON_FRAMES){
+        // señal empezó: arranque limpio
+        WAIT_SIGNAL = false;
+        resetSession(false); // resetea aprendizaje también para empezar fino
+        offLevel = baseline;
+        onLevel = baseline + 25;
       }
-      return; // mientras espero start, NO decodifico (no aprende basura)
+      return;
     }
 
     processDecoder(score);
   }
 
   function startLoop(){
-    resetAll();
-    waitingStart = true;
-    scoreWin.length = 0;
-    aboveCount = 0;
+    WAIT_SIGNAL = true;
+    baseline = null;
+    startOnCount = 0;
+
+    resetSession(false);
+    offLevel=null; onLevel=null;
 
     if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
       const step=()=>{ loop(); v.requestVideoFrameCallback(step); };
@@ -334,3 +311,4 @@
 </script>
 </body>
 </html>
+
