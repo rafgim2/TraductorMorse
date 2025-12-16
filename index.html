@@ -9,7 +9,7 @@
     body { margin:0; background:#000; overflow:hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
     video { position:fixed; inset:0; width:100vw; height:100vh; object-fit:cover; transform: scaleX(-1); }
     canvas { position:fixed; inset:0; pointer-events:none; }
-    #out {
+    #out{
       position:fixed; left:16px; right:16px; bottom:16px;
       min-height:56px; padding:12px 14px;
       border:1px solid rgba(0,255,120,.7);
@@ -21,8 +21,7 @@
       white-space:pre-wrap;
       user-select:text;
     }
-    /* capa invisible para arrastrar el recuadro */
-    #dragLayer { position:fixed; inset:0; background:transparent; }
+    #dragLayer{ position:fixed; inset:0; background:transparent; }
   </style>
 </head>
 <body>
@@ -33,10 +32,12 @@
 
 <script>
 (() => {
-  // ===== AJUSTE ÚNICO (si quieres) =====
-  const UNIT_MS = 250; // pon aquí la misma unidad que uses al emitir (punto=1u, raya=3u)
+  // AJUSTA ESTO A TU EMISOR
+  const UNIT_MS = 250;
 
-  // Morse
+  // CUADRO: tamaño fijo y cuadrado exacto
+  const ROI_SIZE_PX = 90; // <-- pequeño. Prueba 70-120
+
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F","--.":"G","....":"H","..":"I",
     ".---":"J","-.-":"K",".-..":"L","--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
@@ -50,74 +51,93 @@
   const out = document.getElementById("out");
   const dragLayer = document.getElementById("dragLayer");
 
-  // ROI pequeño (normalizado a pantalla)
-  let roi = { x: 0.82, y: 0.12, w: 0.12, h: 0.12 };
-
   function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
 
   function syncCanvas() {
-    ov.width = Math.floor(innerWidth * devicePixelRatio);
+    ov.width  = Math.floor(innerWidth  * devicePixelRatio);
     ov.height = Math.floor(innerHeight * devicePixelRatio);
   }
 
-  function drawROI() {
+  // ROI definido por centro normalizado (0..1)
+  let center = { x: 0.88, y: 0.18 };
+
+  function roiRectPx() {
     const w = ov.width, h = ov.height;
+    const size = ROI_SIZE_PX * devicePixelRatio;
+    const rx = Math.round(center.x * w - size/2);
+    const ry = Math.round(center.y * h - size/2);
+    return { rx, ry, size, w, h };
+  }
+
+  function drawROI() {
+    const { rx, ry, size, w, h } = roiRectPx();
     ctx.clearRect(0,0,w,h);
 
-    const rx = roi.x*w, ry = roi.y*h, rw = roi.w*w, rh = roi.h*h;
     ctx.lineWidth = 3 * devicePixelRatio;
-    ctx.strokeStyle = "rgba(0,255,120,0.9)";
-    ctx.fillStyle = "rgba(0,255,120,0.10)";
+    ctx.strokeStyle = "rgba(0,255,120,0.92)";
+    ctx.fillStyle   = "rgba(0,255,120,0.10)";
     ctx.beginPath();
-    ctx.roundRect(rx, ry, rw, rh, 14 * devicePixelRatio);
+    ctx.roundRect(rx, ry, size, size, 12 * devicePixelRatio);
     ctx.fill();
     ctx.stroke();
   }
 
-  // Arrastrar ROI
+  // Drag: comprobar si el dedo/ratón está dentro del cuadrado
   let dragging=false, offx=0, offy=0;
-  function pointerNorm(e){
-    return { x: e.clientX / innerWidth, y: e.clientY / innerHeight };
+  function pointerPx(e){
+    return { x: e.clientX * devicePixelRatio, y: e.clientY * devicePixelRatio };
   }
-  function inside(p){
-    return p.x>=roi.x && p.x<=roi.x+roi.w && p.y>=roi.y && p.y<=roi.y+roi.h;
+  function inside(px, py) {
+    const { rx, ry, size } = roiRectPx();
+    return px >= rx && px <= rx + size && py >= ry && py <= ry + size;
   }
+
   dragLayer.addEventListener("pointerdown", (e) => {
-    const p = pointerNorm(e);
-    if (inside(p)) {
-      dragging=true;
-      offx = p.x - roi.x;
-      offy = p.y - roi.y;
+    const p = pointerPx(e);
+    const { rx, ry } = roiRectPx();
+    if (inside(p.x, p.y)) {
+      dragging = true;
+      offx = p.x - rx;
+      offy = p.y - ry;
       dragLayer.setPointerCapture(e.pointerId);
     }
   });
+
   dragLayer.addEventListener("pointermove", (e) => {
     if (!dragging) return;
-    const p = pointerNorm(e);
-    roi.x = clamp(p.x - offx, 0, 1 - roi.w);
-    roi.y = clamp(p.y - offy, 0, 1 - roi.h);
+    const p = pointerPx(e);
+    const w = ov.width, h = ov.height;
+    const size = ROI_SIZE_PX * devicePixelRatio;
+
+    // queremos que el cuadrado quede dentro de pantalla
+    const rx = clamp(p.x - offx, 0, w - size);
+    const ry = clamp(p.y - offy, 0, h - size);
+
+    center.x = (rx + size/2) / w;
+    center.y = (ry + size/2) / h;
   });
+
   dragLayer.addEventListener("pointerup", () => dragging=false);
   dragLayer.addEventListener("pointercancel", () => dragging=false);
 
-  // Luminancia media dentro del ROI
   function roiLuminance() {
     const w = ov.width, h = ov.height;
 
-    // Pintamos frame en canvas (espejado como el vídeo)
+    // frame (espejado igual que el vídeo)
     ctx.save();
     ctx.setTransform(-1,0,0,1,w,0);
     ctx.drawImage(video, 0, 0, w, h);
     ctx.restore();
 
-    const rx = Math.floor(roi.x*w), ry = Math.floor(roi.y*h);
-    const rw = Math.max(1, Math.floor(roi.w*w)), rh = Math.max(1, Math.floor(roi.h*h));
+    const { rx, ry, size } = roiRectPx();
+    const x = clamp(rx, 0, w-1);
+    const y = clamp(ry, 0, h-1);
+    const s = Math.max(1, Math.min(size, w-x, h-y));
 
-    const data = ctx.getImageData(rx, ry, rw, rh).data;
+    const data = ctx.getImageData(x, y, s, s).data;
 
-    // muestreo rápido
     let sum = 0;
-    const step = 16;
+    const step = 16; // muestreo rápido
     for (let i=0; i<data.length; i+=step) {
       const r=data[i], g=data[i+1], b=data[i+2];
       sum += 0.2126*r + 0.7152*g + 0.0722*b;
@@ -125,7 +145,6 @@
     const n = Math.max(1, Math.floor(data.length/step));
     const lum = (sum/n)/255;
 
-    // volvemos a dibujar SOLO el ROI (sin dejar el frame pintado)
     drawROI();
     return lum;
   }
@@ -134,13 +153,12 @@
   let baseline = 0, smooth = 0;
   let lastOn = false;
   let lastSwitch = performance.now();
-  let current = "";   // ".-"
+  let current = "";
   let text = "";
 
   function flushLetter() {
     if (!current) return;
-    const ch = MORSE[current] ?? "�";
-    text += ch;
+    text += (MORSE[current] ?? "�");
     out.textContent = text;
     current = "";
   }
@@ -150,26 +168,18 @@
       out.textContent = text;
     }
   }
-
   function classifyOn(ms) {
-    return (ms < UNIT_MS * 2.0) ? "." : "-"; // <2u punto, >=2u raya
+    return (ms < UNIT_MS * 2.0) ? "." : "-";
   }
-
   function transition(now, isOn) {
     const dt = now - lastSwitch;
     lastSwitch = now;
 
     if (lastOn && !isOn) {
-      // fin de símbolo
       current += classifyOn(dt);
     } else if (!lastOn && isOn) {
-      // fin de gap
-      if (dt >= UNIT_MS * 6.2) {      // ~7u palabra
-        flushLetter();
-        addSpace();
-      } else if (dt >= UNIT_MS * 2.2) { // ~3u letra
-        flushLetter();
-      }
+      if (dt >= UNIT_MS * 6.2) { flushLetter(); addSpace(); }
+      else if (dt >= UNIT_MS * 2.2) { flushLetter(); }
     }
     lastOn = isOn;
   }
@@ -177,30 +187,21 @@
   function tick() {
     const lum = roiLuminance();
 
-    // filtros
     baseline = baseline + 0.02 * (lum - baseline);
     smooth   = smooth   + 0.20 * (lum - smooth);
 
-    // umbral dinámico simple con histéresis
-    const delta = 0.05;                 // sensibilidad fija (simple)
+    const delta = 0.05;
     const onTh  = baseline + delta;
-    const offTh = baseline + delta*0.6;
+    const offTh = baseline + delta * 0.6;
 
     const isOn = lastOn ? (smooth > offTh) : (smooth > onTh);
 
     if (isOn !== lastOn) {
       transition(performance.now(), isOn);
     } else if (!isOn && current) {
-      // si se queda en silencio suficiente, cerramos letra
       const gap = performance.now() - lastSwitch;
-      if (gap >= UNIT_MS * 2.8) {
-        flushLetter();
-        lastSwitch = performance.now();
-      }
-      if (gap >= UNIT_MS * 7.5) {
-        addSpace();
-        lastSwitch = performance.now();
-      }
+      if (gap >= UNIT_MS * 2.8) { flushLetter(); lastSwitch = performance.now(); }
+      if (gap >= UNIT_MS * 7.5) { addSpace();   lastSwitch = performance.now(); }
     }
 
     requestAnimationFrame(tick);
@@ -217,13 +218,11 @@
 
     syncCanvas();
     drawROI();
-
     requestAnimationFrame(tick);
   }
 
   window.addEventListener("resize", () => { syncCanvas(); drawROI(); });
 
-  // Arranque inmediato
   start().catch(() => {
     out.textContent = "No se pudo acceder a la cámara (usa https o localhost).";
   });
