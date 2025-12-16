@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (preamble sync)</title>
+<title>Morse Decoder (lock por preámbulo)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -21,6 +21,7 @@
 </style>
 </head>
 <body>
+
 <video id="v" autoplay playsinline muted></video>
 <canvas id="ui"></canvas>
 <div id="out"></div>
@@ -28,26 +29,27 @@
 <script>
 (() => {
   /* ===== UI mínima ===== */
-  const ROI_DRAW = 24;      // cuadrado visible (pequeño)
-  const ROI_READ = 72;      // área real analizada (más fácil)
-  const SAMPLE_STEP = 4;    // rendimiento
-  const K_CONTRAST = 0.90;  // robustez con bordes/glow
+  const ROI_DRAW = 24;     // cuadrado visible (pequeño)
+  const ROI_READ = 72;     // zona real analizada (más fácil)
+  const SAMPLE_STEP = 4;   // rendimiento
+  const K_CONTRAST = 0.85; // score = mean + K*contrast
 
-  /* ===== Enganche por preámbulo ===== */
-  const DOT_ON_MIN  = 2;    // frames
-  const DOT_ON_MAX  = 20;   // frames
-  const DOT_OFF_MAX = 26;   // frames (gap corto entre puntos/letras)
-  const PREAMBLE_DOTS_NEEDED = 6;  // con 6 puntos seguidos ya engancha siempre
+  /* ===== Lock por preámbulo (puntos) ===== */
+  const DOT_MAX_FRAMES = 18;     // un punto no debería pasar de esto
+  const DOT_GAP_MAX_FRAMES = 22; // gap entre símbolos del punto (1u) aprox
+  const DOT_SAMPLES_NEEDED = 10; // cuántos puntos necesitamos para fijar u con seguridad
 
-  /* ===== Fin de sesión ===== */
-  const END_OFF_FRAMES = 180; // si hay silencio muy largo, resetea (a 60fps ~3s)
+  /* ===== Umbrales morse en unidades (frames) ===== */
+  const DASH_THRESHOLD = 2.0;    // dash si ON >= 2u
+  const LETTER_GAP = 1.3;        // cerrar letra si OFF >= 1.3u
+  const WORD_GAP = 6.0;          // palabra si OFF >= 6u
+  const SILENCE_RESET = 12.0;    // resetea sesión si OFF >= 12u (fin)
 
-  /* ===== Morse ===== */
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
     "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
     "--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
-    "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
+    "...":"S","-":"T","..":"U","...-":"V",".--":"W","-..-":"X",
     "-.--":"Y","--..":"Z",
     "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
     ".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
@@ -101,7 +103,6 @@
     const cx=Math.floor(roi.x+ROI_DRAW/2);
     const cy=Math.floor(roi.y+ROI_DRAW/2);
     const half=Math.floor(ROI_READ/2);
-
     const x=Math.max(0, Math.min(cv.width-ROI_READ, cx-half));
     const y=Math.max(0, Math.min(cv.height-ROI_READ, cy-half));
 
@@ -114,214 +115,213 @@
       for(let xx=0; xx<ROI_READ; xx+=SAMPLE_STEP){
         const i=(yy*ROI_READ+xx)*4;
         const r=img[i], g=img[i+1], b=img[i+2];
-        const lum = (0.2126*r + 0.7152*g + 0.0722*b) | 0;
+        const lum=(0.2126*r + 0.7152*g + 0.0722*b) | 0;
         sum += lum;
         bins[lum>>2]++;
         count++;
       }
     }
 
-    const mean = sum / Math.max(1,count);
+    const mean = sum/Math.max(1,count);
 
-    // percentiles
     let acc=0;
     const p10T=count*0.10, p90T=count*0.90;
     let p10=0, p90=255;
-
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){ p10=bi<<2; break; } }
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){p10=bi<<2; break;} }
     acc=0;
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){ p90=bi<<2; break; } }
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){p90=bi<<2; break;} }
 
-    const contrast = Math.max(0, p90-p10);
+    const contrast=Math.max(0,p90-p10);
     return mean + K_CONTRAST*contrast;
   }
 
-  /* ===== Detector ON/OFF robusto =====
-     baselineLow sigue el "suelo" lentamente: no se contamina tanto si esperas.
-  */
-  let baselineLow=null;   // seguimiento del nivel OFF "mínimo"
-  let onLevel=null;
-  let stableOn=false;
+  /* ===== Detector ON/OFF robusto con baseline ===== */
+  let base=null;      // baseline OFF lento
+  let hi=null;        // nivel ON aproximado (para separar)
+  let onState=false;
 
-  // contadores de estado
+  function decideOn(score){
+    if(base==null){ base=score; hi=score+30; }
+    // baseline lento (evita que “aprenda basura” rápido)
+    base = base + 0.01*(score-base);
+
+    // umbral relativo (si cambia exposición, sigue funcionando)
+    const delta = Math.max(16, (hi-base)*0.25);
+    const onTh  = base + delta;
+    const offTh = base + delta*0.65;
+
+    const next = onState ? (score > offTh) : (score > onTh);
+
+    // actualiza hi solo si estamos realmente ON
+    if(next){
+      hi = hi + 0.06*(score-hi);
+      if(hi < base + 25) hi = base + 25;
+    }
+    return next;
+  }
+
+  /* ===== Estado MORSE ===== */
   let onF=0, offF=0;
+  let current="";
+  let text="";
+  let letterClosed=false;
 
-  // sincronización por preámbulo
-  let preDots=0;
-  let synced=false;
+  // Lock por preámbulo
+  let locked=false;
+  let u=null;                 // unidad en frames una vez lock
+  const dotFrames=[];         // para fijar u
 
-  // aprendizaje de u (frames por punto) una vez synced
-  const dots=[];
-  function pushDot(n){ dots.push(n); if(dots.length>30) dots.shift(); }
-  function dotUnit(){
-    if(dots.length<8) return null;
-    const s=[...dots].sort((a,b)=>a-b);
+  // “Armar” salida tras el primer espacio (gap de palabra) entre preámbulo y mensaje
+  let armed=false;
+
+  function resetAll(keepBaseline=true){
+    onF=0; offF=0; onState=false;
+    current=""; text=""; out.textContent="";
+    letterClosed=false;
+
+    locked=false;
+    u=null;
+    dotFrames.length=0;
+
+    armed=false;
+
+    if(!keepBaseline){
+      base=null; hi=null;
+    }
+  }
+
+  function median(arr){
+    const s=[...arr].sort((a,b)=>a-b);
     return s[Math.floor(s.length/2)];
   }
 
-  // armar salida tras primer gap de palabra (separador preámbulo→mensaje)
-  let armed=false;
-
-  // texto
-  let current="", text="", letterClosed=false;
-
-  function resetAll(){
-    // no reseteamos baselineLow del todo (mejor estabilidad visual), pero sí el resto
-    stableOn=false; onF=0; offF=0;
-    preDots=0; synced=false;
-    dots.length=0; armed=false;
-    current=""; text=""; out.textContent="";
-    letterClosed=false;
+  function classifySymbol(onLen){
+    return (onLen < DASH_THRESHOLD*u) ? "." : "-";
   }
 
-  function flush(u){
+  function flushLetter(){
     if(!current) return;
 
-    if(!synced || !armed){
+    if(!locked || !armed){
+      // preámbulo o antes del separador: se descarta
       current="";
       return;
     }
 
     text += (MORSE[current] ?? "�");
-    out.textContent = text;
+    out.textContent=text;
     current="";
   }
 
   function addSpace(){
-    if(!synced) return;
+    if(!locked) return;
 
-    // el primer espacio tras preámbulo arma el mensaje real
     if(!armed){
+      // este es el separador preámbulo → mensaje real
       armed=true;
-      text=""; out.textContent="";
+      text="";
+      out.textContent="";
       current="";
       return;
     }
 
     if(text && !text.endsWith(" ")){
       text += " ";
-      out.textContent = text;
+      out.textContent=text;
     }
   }
 
-  function process(){
-    const score = readScore();
-    if(score == null) return;
+  function tryLockFromDot(onLen, offLen){
+    // Queremos detectar una ristra de puntos (EEE...): ON corto y gaps cortos (1u)
+    if(onLen <= DOT_MAX_FRAMES && offLen <= DOT_GAP_MAX_FRAMES){
+      dotFrames.push(onLen);
+      if(dotFrames.length > 30) dotFrames.shift();
 
-    // baselineLow: sigue el suelo (OFF) lentamente y “conservador”
-    if(baselineLow==null) baselineLow = score;
-    // si score baja, baja rápido; si sube, sube muy lento (evita contaminarse)
-    if(score < baselineLow) baselineLow = baselineLow + 0.20*(score - baselineLow);
-    else baselineLow = baselineLow + 0.01*(score - baselineLow);
+      if(dotFrames.length >= DOT_SAMPLES_NEEDED){
+        u = median(dotFrames);
+        if(u < 2) u = 2;      // seguridad
+        locked = true;
 
-    if(onLevel==null) onLevel = baselineLow + 25;
-
-    // umbral dinámico
-    const thr = (baselineLow + onLevel) / 2;
-    const hyster = 10;
-    const rawOn = stableOn ? (score > thr - hyster) : (score > thr + hyster);
-
-    // actualiza niveles
-    const aOn=0.08, aOff=0.04;
-    if(rawOn) onLevel = onLevel + aOn*(score - onLevel);
-    else      baselineLow = baselineLow + aOff*(score - baselineLow);
-    if(onLevel < baselineLow + 18) onLevel = baselineLow + 18;
-
-    // contadores
-    if(rawOn){
-      onF++;
-      if(!stableOn){
-        // OFF->ON
-        // si silencio largo sin señal, resetea sesión lógica (pero baseline queda)
-        if(offF >= END_OFF_FRAMES) resetAll();
-
-        // si aún no synced, solo buscamos patrón de puntos
-        if(!synced){
-          // nada, el punto se cuenta en ON->OFF
-        } else {
-          // ya synced: gap letra/palabra usando u
-          const u = dotUnit();
-          if(u){
-            if(offF >= 6*u){ flush(u); addSpace(); letterClosed=true; }
-            else if(offF >= 1.3*u){ flush(u); letterClosed=true; }
-          }
-        }
-
-        offF=0;
-        stableOn=true;
+        // al lock: limpiamos por completo la decodificación (pero mantenemos baseline)
+        current=""; letterClosed=false;
+        // NO armamos aún: armamos al primer gap de palabra
+        armed=false;
       }
     } else {
-      offF++;
-      if(stableOn){
-        // ON->OFF
-        if(!synced){
-          // Detectar puntos de preámbulo: ON corto + OFF no enorme
-          if(onF >= DOT_ON_MIN && onF <= DOT_ON_MAX && offF <= DOT_OFF_MAX){
-            preDots++;
-          } else {
-            // si rompe patrón, reinicia contador
-            preDots = 0;
-          }
-
-          // Cuando hay suficientes puntos seguidos => SYNC
-          if(preDots >= PREAMBLE_DOTS_NEEDED){
-            synced = true;
-            armed = false;
-            dots.length = 0;
-            current = "";
-            text = ""; out.textContent = "";
-          }
-
-          // aun sin synced, no aprendemos u para no contaminar
-        } else {
-          // Ya synced: aprender u con puntos (ON cortos)
-          if(onF > 0 && onF <= 18) pushDot(onF);
-
-          const u = dotUnit();
-          if(u){
-            current += (onF < 2*u ? "." : "-");
-            letterClosed=false;
-          }
-        }
-
-        onF=0;
-        stableOn=false;
-      }
+      // si se rompió el patrón, vacía poco a poco (no de golpe) para tolerar jitter
+      if(dotFrames.length > 0) dotFrames.pop();
     }
+  }
 
-    // cierre por silencio (si ya synced)
-    if(synced){
-      const u = dotUnit();
-      if(u && !stableOn){
-        if(current && offF >= 1.8*u && !letterClosed){
-          flush(u); letterClosed=true;
-        }
-        if(offF >= 6*u){
-          addSpace();
-        }
-        // fin de sesión
-        if(offF >= 12*u){
-          // listo para próxima emisión
-          resetAll();
-        }
-      }
-    }
+  function processFrame(){
+    const score = readScore();
+    if(score==null) return;
 
-    // dibuja ROI
+    // dibuja ROI pequeño
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
     ctxU.lineWidth=2;
     ctxU.strokeRect(roi.x,roi.y,ROI_DRAW,ROI_DRAW);
+
+    const nextOn = decideOn(score);
+
+    if(nextOn){
+      onF++;
+      if(!onState){
+        // OFF -> ON (gap terminó)
+        // si ya tenemos u, interpretamos gap letra/palabra
+        if(locked && u){
+          if(offF >= WORD_GAP*u){ flushLetter(); addSpace(); letterClosed=true; }
+          else if(offF >= LETTER_GAP*u){ flushLetter(); letterClosed=true; }
+        }
+        offF=0;
+        onState=true;
+      }
+    } else {
+      offF++;
+      if(onState){
+        // ON -> OFF (pulso terminó)
+        const onLen = onF;
+        const offLen = offF; // ojo: offF ya vale 1 aquí, pero sirve como “gap inicial”
+
+        if(!locked){
+          // Intentamos lockear mirando “puntos repetidos”
+          tryLockFromDot(onLen, offLen);
+        } else if(u){
+          current += classifySymbol(onLen);
+          letterClosed=false;
+        }
+
+        onF=0;
+        onState=false;
+      }
+    }
+
+    // cierres por silencio
+    if(locked && u && !onState){
+      if(current && offF >= 1.8*u && !letterClosed){
+        flushLetter();
+        letterClosed=true;
+      }
+      if(offF >= WORD_GAP*u){
+        addSpace();
+      }
+      if(offF >= SILENCE_RESET*u){
+        // fin de emisión: deja el detector listo para la próxima sin arrastrar “armed”
+        // mantenemos baseline (para no tardar en enganchar)
+        const keepBaseline=true;
+        resetAll(keepBaseline);
+      }
+    }
   }
 
   function startLoop(){
-    resetAll();
-    baselineLow=null; onLevel=null;
+    resetAll(false);
     if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
-      const step=()=>{ process(); v.requestVideoFrameCallback(step); };
+      const step=()=>{ processFrame(); v.requestVideoFrameCallback(step); };
       v.requestVideoFrameCallback(step);
     } else {
-      const step=()=>{ process(); requestAnimationFrame(step); };
+      const step=()=>{ processFrame(); requestAnimationFrame(step); };
       step();
     }
   }
