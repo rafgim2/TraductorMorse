@@ -6,37 +6,36 @@
   <title>Morse Decoder</title>
   <style>
     :root { color-scheme: dark; }
-    body { margin:0; background:#000; overflow:hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    body { margin:0; background:#000; overflow:hidden; }
     video { position:fixed; inset:0; width:100vw; height:100vh; object-fit:cover; transform: scaleX(-1); }
     canvas { position:fixed; inset:0; pointer-events:none; }
+    #drag { position:fixed; inset:0; background:transparent; }
     #out{
-      position:fixed; left:16px; right:16px; bottom:16px;
-      min-height:56px; padding:12px 14px;
+      position:fixed; left:12px; right:12px; bottom:12px;
+      min-height:48px; padding:10px 12px;
       border:1px solid rgba(0,255,120,.7);
       border-radius:14px;
       background: rgba(0,0,0,.55);
       color:#7CFF9D;
-      font-size:20px;
-      line-height:1.3;
+      font: 20px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial;
       white-space:pre-wrap;
       user-select:text;
     }
-    #dragLayer{ position:fixed; inset:0; background:transparent; }
   </style>
 </head>
 <body>
-  <video id="video" autoplay playsinline muted></video>
-  <canvas id="ov"></canvas>
-  <div id="dragLayer"></div>
+  <video id="v" autoplay playsinline muted></video>
+  <canvas id="c"></canvas>
+  <div id="drag"></div>
   <div id="out"></div>
 
 <script>
 (() => {
-  // AJUSTA ESTO A TU EMISOR
+  // === IGUAL QUE TU EMISOR ===
   const UNIT_MS = 250;
 
-  // CUADRO: tamaño fijo y cuadrado exacto
-  const ROI_SIZE_PX = 90; // <-- pequeño. Prueba 70-120
+  // === CUADRO CUADRADO Y PEQUEÑO (px exactos) ===
+  const ROI_SIZE_PX = 40; // prueba 30/40/50
 
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F","--.":"G","....":"H","..":"I",
@@ -45,100 +44,93 @@
     "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
   };
 
-  const video = document.getElementById("video");
-  const ov = document.getElementById("ov");
-  const ctx = ov.getContext("2d", { willReadFrequently: true });
+  const v = document.getElementById("v");
+  const c = document.getElementById("c");
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  const drag = document.getElementById("drag");
   const out = document.getElementById("out");
-  const dragLayer = document.getElementById("dragLayer");
 
-  function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
+  const clamp = (x,a,b)=>Math.max(a,Math.min(b,x));
 
-  function syncCanvas() {
-    ov.width  = Math.floor(innerWidth  * devicePixelRatio);
-    ov.height = Math.floor(innerHeight * devicePixelRatio);
+  function syncCanvas(){
+    c.width  = Math.floor(innerWidth  * devicePixelRatio);
+    c.height = Math.floor(innerHeight * devicePixelRatio);
   }
 
-  // ROI definido por centro normalizado (0..1)
+  // ROI por centro normalizado
   let center = { x: 0.88, y: 0.18 };
 
-  function roiRectPx() {
-    const w = ov.width, h = ov.height;
-    const size = ROI_SIZE_PX * devicePixelRatio;
-    const rx = Math.round(center.x * w - size/2);
-    const ry = Math.round(center.y * h - size/2);
-    return { rx, ry, size, w, h };
+  function roiRect(){
+    const w = c.width, h = c.height;
+    const s = ROI_SIZE_PX * devicePixelRatio;
+    const rx = Math.round(center.x*w - s/2);
+    const ry = Math.round(center.y*h - s/2);
+    return { w, h, s, rx, ry };
   }
 
-  function drawROI() {
-    const { rx, ry, size, w, h } = roiRectPx();
+  function drawROI(){
+    const { w,h,s,rx,ry } = roiRect();
     ctx.clearRect(0,0,w,h);
-
     ctx.lineWidth = 3 * devicePixelRatio;
     ctx.strokeStyle = "rgba(0,255,120,0.92)";
-    ctx.fillStyle   = "rgba(0,255,120,0.10)";
+    ctx.fillStyle = "rgba(0,255,120,0.10)";
     ctx.beginPath();
-    ctx.roundRect(rx, ry, size, size, 12 * devicePixelRatio);
+    ctx.roundRect(rx, ry, s, s, 8*devicePixelRatio);
     ctx.fill();
     ctx.stroke();
   }
 
-  // Drag: comprobar si el dedo/ratón está dentro del cuadrado
+  // Drag ROI
   let dragging=false, offx=0, offy=0;
-  function pointerPx(e){
-    return { x: e.clientX * devicePixelRatio, y: e.clientY * devicePixelRatio };
-  }
-  function inside(px, py) {
-    const { rx, ry, size } = roiRectPx();
-    return px >= rx && px <= rx + size && py >= ry && py <= ry + size;
+  const pointerPx = (e)=>({ x:e.clientX*devicePixelRatio, y:e.clientY*devicePixelRatio });
+
+  function inside(px,py){
+    const { s,rx,ry } = roiRect();
+    return px>=rx && px<=rx+s && py>=ry && py<=ry+s;
   }
 
-  dragLayer.addEventListener("pointerdown", (e) => {
+  drag.addEventListener("pointerdown", (e)=>{
     const p = pointerPx(e);
-    const { rx, ry } = roiRectPx();
-    if (inside(p.x, p.y)) {
-      dragging = true;
-      offx = p.x - rx;
-      offy = p.y - ry;
-      dragLayer.setPointerCapture(e.pointerId);
+    const { rx,ry } = roiRect();
+    if (inside(p.x,p.y)){
+      dragging=true;
+      offx = p.x - rx; offy = p.y - ry;
+      drag.setPointerCapture(e.pointerId);
     }
   });
 
-  dragLayer.addEventListener("pointermove", (e) => {
+  drag.addEventListener("pointermove", (e)=>{
     if (!dragging) return;
     const p = pointerPx(e);
-    const w = ov.width, h = ov.height;
-    const size = ROI_SIZE_PX * devicePixelRatio;
-
-    // queremos que el cuadrado quede dentro de pantalla
-    const rx = clamp(p.x - offx, 0, w - size);
-    const ry = clamp(p.y - offy, 0, h - size);
-
-    center.x = (rx + size/2) / w;
-    center.y = (ry + size/2) / h;
+    const w=c.width, h=c.height;
+    const s = ROI_SIZE_PX * devicePixelRatio;
+    const rx = clamp(p.x - offx, 0, w - s);
+    const ry = clamp(p.y - offy, 0, h - s);
+    center.x = (rx + s/2) / w;
+    center.y = (ry + s/2) / h;
   });
 
-  dragLayer.addEventListener("pointerup", () => dragging=false);
-  dragLayer.addEventListener("pointercancel", () => dragging=false);
+  drag.addEventListener("pointerup", ()=>dragging=false);
+  drag.addEventListener("pointercancel", ()=>dragging=false);
 
-  function roiLuminance() {
-    const w = ov.width, h = ov.height;
+  function roiLuminance(){
+    const { w,h,s,rx,ry } = roiRect();
 
-    // frame (espejado igual que el vídeo)
+    // dibuja frame (espejado como el vídeo)
     ctx.save();
     ctx.setTransform(-1,0,0,1,w,0);
-    ctx.drawImage(video, 0, 0, w, h);
+    ctx.drawImage(v, 0, 0, w, h);
     ctx.restore();
 
-    const { rx, ry, size } = roiRectPx();
     const x = clamp(rx, 0, w-1);
     const y = clamp(ry, 0, h-1);
-    const s = Math.max(1, Math.min(size, w-x, h-y));
+    const ss = Math.max(1, Math.min(s, w-x, h-y));
 
-    const data = ctx.getImageData(x, y, s, s).data;
+    const data = ctx.getImageData(x, y, ss, ss).data;
 
-    let sum = 0;
-    const step = 16; // muestreo rápido
-    for (let i=0; i<data.length; i+=step) {
+    let sum=0;
+    const step=16;
+    for (let i=0;i<data.length;i+=step){
       const r=data[i], g=data[i+1], b=data[i+2];
       sum += 0.2126*r + 0.7152*g + 0.0722*b;
     }
@@ -149,83 +141,112 @@
     return lum;
   }
 
-  // Decodificación
-  let baseline = 0, smooth = 0;
-  let lastOn = false;
-  let lastSwitch = performance.now();
-  let current = "";
-  let text = "";
+  // ===== Decodificador (1/3/7 EXACTO como tu emisor) =====
+  let baseline=0, smooth=0;
+  let lastOn=false;
+  let lastSwitch=performance.now();
+  let current=""; // .-..
+  let text="";
 
-  function flushLetter() {
+  // flags para que en un mismo silencio no meta varias veces letra/espacio
+  let letterFlushedInGap=false;
+  let spaceAddedInGap=false;
+
+  function flushLetter(){
     if (!current) return;
     text += (MORSE[current] ?? "�");
     out.textContent = text;
-    current = "";
+    current="";
   }
-  function addSpace() {
+
+  function addSpace(){
     if (!text.endsWith(" ")) {
       text += " ";
       out.textContent = text;
     }
   }
-  function classifyOn(ms) {
-    return (ms < UNIT_MS * 2.0) ? "." : "-";
+
+  function classifyOn(ms){
+    // tu emisor usa 1u y 3u; umbral 2u es perfecto
+    return (ms < UNIT_MS * 2) ? "." : "-";
   }
-  function transition(now, isOn) {
+
+  function onTransition(now, isOn){
     const dt = now - lastSwitch;
     lastSwitch = now;
 
-    if (lastOn && !isOn) {
-      current += classifyOn(dt);
-    } else if (!lastOn && isOn) {
-      if (dt >= UNIT_MS * 6.2) { flushLetter(); addSpace(); }
-      else if (dt >= UNIT_MS * 2.2) { flushLetter(); }
+    // reset de flags al arrancar un pulso (nuevo gap termina)
+    if (isOn){
+      letterFlushedInGap = false;
+      spaceAddedInGap = false;
     }
+
+    if (lastOn && !isOn){
+      // ON -> OFF: terminó símbolo
+      current += classifyOn(dt);
+    } else if (!lastOn && isOn){
+      // OFF -> ON: terminó gap (si era 3u ya habríamos flush en tick, pero esto también vale)
+      // no hace falta nada aquí
+    }
+
     lastOn = isOn;
   }
 
-  function tick() {
+  function tick(){
     const lum = roiLuminance();
 
-    baseline = baseline + 0.02 * (lum - baseline);
-    smooth   = smooth   + 0.20 * (lum - smooth);
+    baseline += 0.02 * (lum - baseline);
+    smooth   += 0.20 * (lum - smooth);
 
+    // umbral simple + histéresis (sin UI)
     const delta = 0.05;
     const onTh  = baseline + delta;
-    const offTh = baseline + delta * 0.6;
+    const offTh = baseline + delta*0.6;
 
     const isOn = lastOn ? (smooth > offTh) : (smooth > onTh);
 
-    if (isOn !== lastOn) {
-      transition(performance.now(), isOn);
-    } else if (!isOn && current) {
-      const gap = performance.now() - lastSwitch;
-      if (gap >= UNIT_MS * 2.8) { flushLetter(); lastSwitch = performance.now(); }
-      if (gap >= UNIT_MS * 7.5) { addSpace();   lastSwitch = performance.now(); }
+    const now = performance.now();
+
+    if (isOn !== lastOn){
+      onTransition(now, isOn);
+    } else {
+      // Si estamos en OFF y el emisor mete 3u o 7u, cerramos letra/palabra aunque no llegue otro ON (p.ej. al final)
+      if (!isOn){
+        const gap = now - lastSwitch;
+
+        if (current && !letterFlushedInGap && gap >= 3 * UNIT_MS){
+          flushLetter();
+          letterFlushedInGap = true;
+        }
+
+        if (!spaceAddedInGap && gap >= 7 * UNIT_MS){
+          // si era espacio real (o silencio final), añade un espacio una sola vez
+          addSpace();
+          spaceAddedInGap = true;
+        }
+      }
     }
 
     requestAnimationFrame(tick);
   }
 
-  async function start() {
+  async function start(){
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "environment", width:{ideal:1280}, height:{ideal:720} },
-      audio: false
+      video: { facingMode:"environment", width:{ideal:1280}, height:{ideal:720} },
+      audio:false
     });
-    video.srcObject = stream;
-    await new Promise(r => video.onloadedmetadata = r);
-    video.play();
+    v.srcObject = stream;
+    await new Promise(r => v.onloadedmetadata = r);
+    v.play();
 
     syncCanvas();
     drawROI();
     requestAnimationFrame(tick);
   }
 
-  window.addEventListener("resize", () => { syncCanvas(); drawROI(); });
+  addEventListener("resize", ()=>{ syncCanvas(); drawROI(); });
 
-  start().catch(() => {
-    out.textContent = "No se pudo acceder a la cámara (usa https o localhost).";
-  });
+  start().catch(()=>{ out.textContent = "Cámara no disponible (usa https o localhost)."; });
 })();
 </script>
 </body>
