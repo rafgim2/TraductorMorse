@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (lock por preámbulo)</title>
+<title>Morse Decoder (LOCK)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -29,27 +29,31 @@
 <script>
 (() => {
   /* ===== UI mínima ===== */
-  const ROI_DRAW = 24;     // cuadrado visible (pequeño)
-  const ROI_READ = 72;     // zona real analizada (más fácil)
+  const ROI_DRAW = 24;     // cuadrado visible
+  const ROI_READ = 72;     // zona REAL analizada (más fácil)
   const SAMPLE_STEP = 4;   // rendimiento
   const K_CONTRAST = 0.85; // score = mean + K*contrast
 
-  /* ===== Lock por preámbulo (puntos) ===== */
-  const DOT_MAX_FRAMES = 18;     // un punto no debería pasar de esto
-  const DOT_GAP_MAX_FRAMES = 22; // gap entre símbolos del punto (1u) aprox
-  const DOT_SAMPLES_NEEDED = 10; // cuántos puntos necesitamos para fijar u con seguridad
+  /* ===== LOCK (clave) =====
+     Detecta el preámbulo como "tren de puntos":
+     - varios ON cortos repetidos
+     - con duración consistente (en frames)
+  */
+  const LOCK_MIN_DOTS = 7;       // cuántos puntos cortos necesito para lock
+  const LOCK_MAX_DOT_FRAMES = 18; // un punto no debería ser más largo que esto (30-60fps)
+  const LOCK_TOL_FRAMES = 2;     // tolerancia de consistencia del punto en frames
 
-  /* ===== Umbrales morse en unidades (frames) ===== */
-  const DASH_THRESHOLD = 2.0;    // dash si ON >= 2u
-  const LETTER_GAP = 1.3;        // cerrar letra si OFF >= 1.3u
-  const WORD_GAP = 6.0;          // palabra si OFF >= 6u
-  const SILENCE_RESET = 12.0;    // resetea sesión si OFF >= 12u (fin)
+  /* ===== Parser Morse (frames) ===== */
+  // Clasificación basada en u (frames)
+  const DOT_DASH_TH = 2.0;       // ON < 2u => dot, si no dash
+  const LETTER_GAP_TH = 1.3;     // OFF >= 1.3u => cierra letra
+  const WORD_GAP_TH = 6.0;       // OFF >= 6u => palabra
 
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
     "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
     "--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
-    "...":"S","-":"T","..":"U","...-":"V",".--":"W","-..-":"X",
+    "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
     "-.--":"Y","--..":"Z",
     "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
     ".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
@@ -70,7 +74,7 @@
   addEventListener("resize", resize);
   resize();
 
-  /* ===== ROI arrastrable ===== */
+  // ROI arrastrable
   let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
   ui.addEventListener("pointerdown",e=>{
     if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI_DRAW &&
@@ -86,6 +90,7 @@
   ui.addEventListener("pointerup",()=>dragging=false);
   ui.addEventListener("pointercancel",()=>dragging=false);
 
+  // draw cover como el video
   function drawCover(){
     const W=cv.width,H=cv.height;
     const vw=v.videoWidth,vh=v.videoHeight;
@@ -97,12 +102,14 @@
     return true;
   }
 
+  // score robusto en ROI_READ: mean + K*(p90-p10)
   function readScore(){
     if(!drawCover()) return null;
 
     const cx=Math.floor(roi.x+ROI_DRAW/2);
     const cy=Math.floor(roi.y+ROI_DRAW/2);
     const half=Math.floor(ROI_READ/2);
+
     const x=Math.max(0, Math.min(cv.width-ROI_READ, cx-half));
     const y=Math.max(0, Math.min(cv.height-ROI_READ, cy-half));
 
@@ -117,77 +124,58 @@
         const r=img[i], g=img[i+1], b=img[i+2];
         const lum=(0.2126*r + 0.7152*g + 0.0722*b) | 0;
         sum += lum;
-        bins[lum>>2]++;
+        bins[lum>>2]++; // /4
         count++;
       }
     }
 
-    const mean = sum/Math.max(1,count);
+    const mean = sum / Math.max(1,count);
 
     let acc=0;
     const p10T=count*0.10, p90T=count*0.90;
     let p10=0, p90=255;
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){p10=bi<<2; break;} }
-    acc=0;
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){p90=bi<<2; break;} }
 
-    const contrast=Math.max(0,p90-p10);
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){ p10=bi<<2; break; } }
+    acc=0;
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){ p90=bi<<2; break; } }
+
+    const contrast = Math.max(0, p90-p10);
     return mean + K_CONTRAST*contrast;
   }
 
-  /* ===== Detector ON/OFF robusto con baseline ===== */
-  let base=null;      // baseline OFF lento
-  let hi=null;        // nivel ON aproximado (para separar)
-  let onState=false;
+  // =========================
+  // LOCK + Decoder state
+  // =========================
 
-  function decideOn(score){
-    if(base==null){ base=score; hi=score+30; }
-    // baseline lento (evita que “aprenda basura” rápido)
-    base = base + 0.01*(score-base);
-
-    // umbral relativo (si cambia exposición, sigue funcionando)
-    const delta = Math.max(16, (hi-base)*0.25);
-    const onTh  = base + delta;
-    const offTh = base + delta*0.65;
-
-    const next = onState ? (score > offTh) : (score > onTh);
-
-    // actualiza hi solo si estamos realmente ON
-    if(next){
-      hi = hi + 0.06*(score-hi);
-      if(hi < base + 25) hi = base + 25;
-    }
-    return next;
-  }
-
-  /* ===== Estado MORSE ===== */
+  // Detector ON/OFF con umbral adaptativo simple (pero SOLO para segmentar)
+  let offLevel=null, onLevel=null;
+  let stableOn=false;
   let onF=0, offF=0;
+
+  // Segmentos recientes para LOCK: guardamos duraciones ON
+  const recentDots = []; // duraciones ON cortas (frames)
+
+  // LOCK state
+  let locked=false;
+  let u=null;
+
+  // Mostrar solo tras separador (word gap) después del lock
+  let armed=false;
   let current="";
   let text="";
   let letterClosed=false;
 
-  // Lock por preámbulo
-  let locked=false;
-  let u=null;                 // unidad en frames una vez lock
-  const dotFrames=[];         // para fijar u
-
-  // “Armar” salida tras el primer espacio (gap de palabra) entre preámbulo y mensaje
-  let armed=false;
-
-  function resetAll(keepBaseline=true){
-    onF=0; offF=0; onState=false;
-    current=""; text=""; out.textContent="";
-    letterClosed=false;
-
-    locked=false;
-    u=null;
-    dotFrames.length=0;
-
+  function resetForNewMessage(){
     armed=false;
+    current="";
+    text="";
+    out.textContent="";
+    letterClosed=false;
+  }
 
-    if(!keepBaseline){
-      base=null; hi=null;
-    }
+  function pushRecentDot(n){
+    recentDots.push(n);
+    if(recentDots.length > 20) recentDots.shift();
   }
 
   function median(arr){
@@ -195,141 +183,164 @@
     return s[Math.floor(s.length/2)];
   }
 
-  function classifySymbol(onLen){
-    return (onLen < DASH_THRESHOLD*u) ? "." : "-";
+  function tryLock(){
+    // Necesitamos suficientes ON cortos
+    if(recentDots.length < LOCK_MIN_DOTS) return false;
+
+    // Tomamos los últimos LOCK_MIN_DOTS
+    const last = recentDots.slice(-LOCK_MIN_DOTS);
+
+    // Deben ser "cortos"
+    if(last.some(x => x > LOCK_MAX_DOT_FRAMES)) return false;
+
+    // Consistencia: mediana y desviación máxima
+    const m = median(last);
+    const maxDev = Math.max(...last.map(x => Math.abs(x - m)));
+
+    if(maxDev <= LOCK_TOL_FRAMES){
+      u = m;            // 1u (frames) = duración del punto (mediana)
+      locked = true;
+      resetForNewMessage(); // empezamos limpios
+      return true;
+    }
+    return false;
+  }
+
+  function classifySymbol(onFrames){
+    return (onFrames < DOT_DASH_TH * u) ? "." : "-";
   }
 
   function flushLetter(){
     if(!current) return;
-
-    if(!locked || !armed){
-      // preámbulo o antes del separador: se descarta
-      current="";
-      return;
-    }
-
+    if(!armed){ current=""; return; } // no mostrar preámbulo
     text += (MORSE[current] ?? "�");
-    out.textContent=text;
+    out.textContent = text;
     current="";
   }
 
   function addSpace(){
-    if(!locked) return;
-
     if(!armed){
-      // este es el separador preámbulo → mensaje real
-      armed=true;
-      text="";
-      out.textContent="";
+      // Este word-gap es el separador preámbulo -> mensaje
+      armed = true;
+      text=""; out.textContent="";
       current="";
       return;
     }
-
     if(text && !text.endsWith(" ")){
       text += " ";
-      out.textContent=text;
+      out.textContent = text;
     }
   }
 
-  function tryLockFromDot(onLen, offLen){
-    // Queremos detectar una ristra de puntos (EEE...): ON corto y gaps cortos (1u)
-    if(onLen <= DOT_MAX_FRAMES && offLen <= DOT_GAP_MAX_FRAMES){
-      dotFrames.push(onLen);
-      if(dotFrames.length > 30) dotFrames.shift();
-
-      if(dotFrames.length >= DOT_SAMPLES_NEEDED){
-        u = median(dotFrames);
-        if(u < 2) u = 2;      // seguridad
-        locked = true;
-
-        // al lock: limpiamos por completo la decodificación (pero mantenemos baseline)
-        current=""; letterClosed=false;
-        // NO armamos aún: armamos al primer gap de palabra
-        armed=false;
-      }
-    } else {
-      // si se rompió el patrón, vacía poco a poco (no de golpe) para tolerar jitter
-      if(dotFrames.length > 0) dotFrames.pop();
+  // Detecta fin de sesión para permitir repetir sin “arrastre”
+  function maybeEndSession(){
+    if(!locked || !u) return;
+    // silencio muy largo => fin emisión
+    if(offF >= 12 * u){
+      // no borramos el lock, pero rearmamos para próxima emisión
+      locked = false;
+      u = null;
+      recentDots.length = 0;
+      resetForNewMessage();
+      // reinicia niveles para segmentar limpio
+      offLevel=null; onLevel=null;
+      stableOn=false; onF=0; offF=0;
     }
   }
 
-  function processFrame(){
-    const score = readScore();
-    if(score==null) return;
+  function processFrame(score){
+    // umbral adaptativo SOLO para segmentar ON/OFF
+    if(offLevel==null){
+      offLevel = onLevel = score;
+    }
 
-    // dibuja ROI pequeño
-    ctxU.clearRect(0,0,ui.width,ui.height);
-    ctxU.strokeStyle="rgba(0,255,120,.9)";
-    ctxU.lineWidth=2;
-    ctxU.strokeRect(roi.x,roi.y,ROI_DRAW,ROI_DRAW);
+    const thr=(offLevel+onLevel)/2;
+    const hyster=10;
+    const rawOn = stableOn ? (score > thr - hyster) : (score > thr + hyster);
 
-    const nextOn = decideOn(score);
+    const a=0.08;
+    if(rawOn) onLevel += a*(score - onLevel);
+    else      offLevel += a*(score - offLevel);
+    if(onLevel < offLevel + 18) onLevel = offLevel + 18;
 
-    if(nextOn){
+    if(rawOn){
       onF++;
-      if(!onState){
-        // OFF -> ON (gap terminó)
-        // si ya tenemos u, interpretamos gap letra/palabra
+      if(!stableOn){
+        // OFF -> ON: aquí cerramos gaps si estamos locked
         if(locked && u){
-          if(offF >= WORD_GAP*u){ flushLetter(); addSpace(); letterClosed=true; }
-          else if(offF >= LETTER_GAP*u){ flushLetter(); letterClosed=true; }
+          if(offF >= WORD_GAP_TH * u){ flushLetter(); addSpace(); letterClosed=true; }
+          else if(offF >= LETTER_GAP_TH * u){ flushLetter(); letterClosed=true; }
         }
         offF=0;
-        onState=true;
+        stableOn=true;
       }
     } else {
       offF++;
-      if(onState){
-        // ON -> OFF (pulso terminó)
-        const onLen = onF;
-        const offLen = offF; // ojo: offF ya vale 1 aquí, pero sirve como “gap inicial”
+      if(stableOn){
+        // ON -> OFF: aquí clasificamos símbolo si locked
+        if(onF > 0){
+          // Alimenta el LOCK con puntos potenciales (ON cortos)
+          if(!locked && onF <= LOCK_MAX_DOT_FRAMES){
+            pushRecentDot(onF);
+            tryLock();
+          }
 
-        if(!locked){
-          // Intentamos lockear mirando “puntos repetidos”
-          tryLockFromDot(onLen, offLen);
-        } else if(u){
-          current += classifySymbol(onLen);
-          letterClosed=false;
+          if(locked && u){
+            current += classifySymbol(onF);
+            letterClosed=false;
+          }
         }
-
         onF=0;
-        onState=false;
+        stableOn=false;
       }
     }
 
-    // cierres por silencio
-    if(locked && u && !onState){
-      if(current && offF >= 1.8*u && !letterClosed){
+    // cierre por silencio (sin ON siguiente)
+    if(locked && u && !stableOn){
+      if(current && offF >= 1.8 * u && !letterClosed){
         flushLetter();
         letterClosed=true;
       }
-      if(offF >= WORD_GAP*u){
+      if(offF >= WORD_GAP_TH * u){
         addSpace();
       }
-      if(offF >= SILENCE_RESET*u){
-        // fin de emisión: deja el detector listo para la próxima sin arrastrar “armed”
-        // mantenemos baseline (para no tardar en enganchar)
-        const keepBaseline=true;
-        resetAll(keepBaseline);
-      }
+      maybeEndSession();
     }
   }
 
+  function loop(){
+    const score = readScore();
+    if(score==null) return;
+
+    // dibuja ROI
+    ctxU.clearRect(0,0,ui.width,ui.height);
+    ctxU.strokeStyle="rgba(0,255,120,.9)";
+    ctxU.lineWidth=2;
+    ctxU.strokeRect(roi.x, roi.y, ROI_DRAW, ROI_DRAW);
+
+    processFrame(score);
+  }
+
   function startLoop(){
-    resetAll(false);
+    // estado inicial
+    locked=false; u=null; recentDots.length=0;
+    offLevel=null; onLevel=null;
+    stableOn=false; onF=0; offF=0;
+    resetForNewMessage();
+
     if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
-      const step=()=>{ processFrame(); v.requestVideoFrameCallback(step); };
+      const step=()=>{ loop(); v.requestVideoFrameCallback(step); };
       v.requestVideoFrameCallback(step);
     } else {
-      const step=()=>{ processFrame(); requestAnimationFrame(step); };
+      const step=()=>{ loop(); requestAnimationFrame(step); };
       step();
     }
   }
 
-  navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
+  navigator.mediaDevices.getUserMedia({ video:{ facingMode:"environment" }, audio:false })
     .then(stream=>{
-      v.srcObject=stream;
-      v.onloadedmetadata=()=>{ v.play(); startLoop(); };
+      v.srcObject = stream;
+      v.onloadedmetadata = ()=>{ v.play(); startLoop(); };
     })
     .catch(()=> out.textContent="No se pudo acceder a la cámara (usa https o localhost).");
 })();
