@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (enganche robusto)</title>
+<title>Morse Decoder (definitivo)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -28,18 +28,19 @@
 
 <script>
 (() => {
-  // UI
-  const ROI_DRAW = 24;     // cuadrado visible
-  const ROI_READ = 72;     // zona real analizada (más fácil)
-  const SAMPLE_STEP = 4;
-  const K_CONTRAST = 0.85;
+  /* ===== UI ===== */
+  const ROI_DRAW = 24;     // cuadrado visible (pequeño)
+  const ROI_READ = 72;     // lectura real (más fácil)
+  const SAMPLE_STEP = 4;   // submuestreo
+  const K_CONTRAST = 0.85; // peso del contraste
 
-  // Enganche (inicio señal)
-  const START_FRAMES = 7;        // ON consecutivos para enganchar
-  const START_SCORE_DELTA = 14;  // subida de score vs baselineMin
-  const START_CONTRAST_DELTA = 18; // subida de contraste vs baselineMinContrast
+  /* Detector relativo fast-slow */
+  const FAST_A = 0.25;     // rápido (sigue destellos)
+  const SLOW_A = 0.01;     // lento (sigue exposición)
+  const DIFF_ON  = 6.5;    // umbral ON (en “score units”)
+  const DIFF_OFF = 3.0;    // umbral OFF (histéresis)
 
-  // Morse
+  /* Morse */
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
     "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
@@ -55,9 +56,9 @@
   const ctxU = ui.getContext("2d");
   const out = document.getElementById("out");
 
-  // offscreen
+  /* offscreen */
   const cv = document.createElement("canvas");
-  const ctxV = cv.getContext("2d",{willReadFrequently:true});
+  const ctxV = cv.getContext("2d", { willReadFrequently:true });
 
   function resize(){
     ui.width = cv.width = innerWidth;
@@ -66,7 +67,7 @@
   addEventListener("resize", resize);
   resize();
 
-  // ROI drag
+  /* ROI arrastrable */
   let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
   ui.addEventListener("pointerdown",e=>{
     if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI_DRAW &&
@@ -93,8 +94,7 @@
     return true;
   }
 
-  // stats en ROI_READ: mean, p10, p90
-  function readStats(){
+  function readScore(){
     if(!drawCover()) return null;
 
     const cx=Math.floor(roi.x+ROI_DRAW/2);
@@ -114,45 +114,36 @@
         const i=(yy*ROI_READ+xx)*4;
         const r=img[i], g=img[i+1], b=img[i+2];
         const lum=(0.2126*r+0.7152*g+0.0722*b)|0;
-        sum += lum;
+        sum+=lum;
         bins[lum>>2]++;
         count++;
       }
     }
 
-    const mean = sum / Math.max(1,count);
+    const mean=sum/Math.max(1,count);
 
+    // percentiles aprox (p10/p90) para contraste robusto
     let acc=0;
     const p10T=count*0.10, p90T=count*0.90;
-    let p10=0, p90=255;
+    let p10=0,p90=255;
 
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){ p10=bi<<2; break; } }
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){p10=bi<<2; break;} }
     acc=0;
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){ p90=bi<<2; break; } }
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){p90=bi<<2; break;} }
 
-    return { mean, p10, p90 };
+    const contrast=Math.max(0,p90-p10);
+    return mean + K_CONTRAST*contrast;
   }
 
-  // ===== Estado “enganche robusto” =====
-  let WAIT_SIGNAL = true;
-  let startCount = 0;
+  /* ===== Decoder por frames + aprendizaje ===== */
+  let fast=null, slow=null;
+  let stableOn=false;
 
-  // En vez de baseline EMA (que se mueve), guardamos mínimos “lentos”
-  let baseMinScore = null;
-  let baseMinContrast = null;
+  let onF=0, offF=0;
+  let current="", text="";
+  let letterClosed=false;
 
-  // Filtro de mínimo con “subida lenta”: si el mínimo real desaparece, sube despacio,
-  // pero nunca se dispara hacia arriba rápido (justo lo que te estaba fastidiando).
-  function minHold(currentMin, x){
-    if(currentMin == null) return x;
-    if(x < currentMin) return x;
-    return currentMin + 0.01*(x - currentMin); // sube MUY lento
-  }
-
-  // ===== Decoder por frames + sesión =====
-  let offLevel=null,onLevel=null, stableOn=false;
-  let onF=0, offF=0, current="", text="", letterClosed=false;
-
+  // aprender u (frames del punto)
   const dots=[];
   function pushDot(n){ dots.push(n); if(dots.length>30) dots.shift(); }
   function dotUnit(){
@@ -161,27 +152,32 @@
     return s[Math.floor(s.length/2)];
   }
 
+  // ready (u estable)
   let ready=false, lastU=null, stableUCount=0;
-  let pendingWordGap=false, armed=false;
 
-  function resetSession(resetLearning){
+  // armado por separador (espacio entre preámbulo y mensaje)
+  let pendingWordGap=false;
+  let armed=false;
+
+  function resetSession(keepLearning=true){
     current=""; text=""; out.textContent="";
-    letterClosed=false;
-    onF=0; offF=0; stableOn=false;
+    onF=0; offF=0; letterClosed=false;
     pendingWordGap=false; armed=false;
 
-    if(resetLearning){
+    if(!keepLearning){
       dots.length=0;
       ready=false; lastU=null; stableUCount=0;
-      offLevel=null; onLevel=null;
     }
   }
 
   function updateReady(u){
     if(!u){ stableUCount=0; lastU=null; ready=false; return; }
-    if(lastU!==null && Math.abs(u-lastU)<=1) stableUCount++; else stableUCount=0;
+    if(lastU!==null && Math.abs(u-lastU)<=1) stableUCount++;
+    else stableUCount=0;
     lastU=u;
     if(stableUCount>=8) ready=true;
+
+    // si vimos separador antes de estar ready, armamos al quedar ready
     if(ready && pendingWordGap && !armed){
       armed=true;
       text=""; out.textContent="";
@@ -193,36 +189,40 @@
     if(!current) return;
     if(!ready || !armed){ current=""; return; }
     text += (MORSE[current] ?? "�");
-    out.textContent=text;
+    out.textContent = text;
     current="";
   }
 
   function addSpace(){
     if(!ready) return;
+
     if(!armed){
+      // este es el separador preámbulo→mensaje real
       armed=true;
       pendingWordGap=false;
       text=""; out.textContent="";
       current="";
       return;
     }
+
     if(text && !text.endsWith(" ")){
       text+=" ";
       out.textContent=text;
     }
   }
 
-  function processDecoder(score){
-    if(offLevel==null){ offLevel=onLevel=score; }
+  function process(){
+    const score=readScore();
+    if(score==null) return;
 
-    const thr=(offLevel+onLevel)/2;
-    const hyster=10;
-    const rawOn = stableOn ? (score>thr-hyster) : (score>thr+hyster);
+    // filtros fast/slow
+    if(fast==null){ fast=score; slow=score; }
+    fast = fast + FAST_A*(score-fast);
+    slow = slow + SLOW_A*(score-slow);
+    const diff = fast - slow;
 
-    const a=0.08;
-    if(rawOn) onLevel += a*(score-onLevel);
-    else      offLevel += a*(score-offLevel);
-    if(onLevel < offLevel + 18) onLevel = offLevel + 18;
+    // ON/OFF por diff (inmune a exposición/deriva)
+    const rawOn = stableOn ? (diff > DIFF_OFF) : (diff > DIFF_ON);
 
     if(rawOn){
       onF++;
@@ -230,103 +230,80 @@
         const u=dotUnit();
         updateReady(u);
 
-        if(!ready && offF>=30) pendingWordGap=true;
+        // si aún no estamos ready, un OFF largo sugiere separador (por seguridad)
+        if(!ready && offF >= 30) pendingWordGap = true;
 
         if(u){
-          if(offF>=6*u){ flush(); addSpace(); letterClosed=true; }
-          else if(offF>=1.3*u){ flush(); letterClosed=true; }
+          if(offF >= 6*u){ flush(); addSpace(); letterClosed=true; }
+          else if(offF >= 1.3*u){ flush(); letterClosed=true; }
         }
-        offF=0; stableOn=true;
+
+        offF=0;
+        stableOn=true;
       }
     } else {
       offF++;
       if(stableOn){
-        if(onF>0 && onF<=16) pushDot(onF);
+        // aprende puntos: ON cortos
+        if(onF>0 && onF<=18) pushDot(onF);
+
         const u=dotUnit();
         updateReady(u);
+
         if(u){
           current += (onF < 2*u ? "." : "-");
           letterClosed=false;
         }
-        onF=0; stableOn=false;
+
+        onF=0;
+        stableOn=false;
       }
     }
 
     const u=dotUnit();
     updateReady(u);
 
+    // cierre por silencio + reset de sesión por silencio largo
     if(!stableOn){
-      if((u && offF>=12*u) || (!u && offF>=140)){
-        // fin de sesión: listo para la próxima emisión
-        resetSession(false); // NO resetear aprendizaje: así la segunda va aún más fina
+      if((u && offF >= 12*u) || (!u && offF >= 160)){
+        resetSession(true); // nueva emisión limpia, sin tragarse E
       }
 
       if(u){
-        if(current && offF>=1.8*u && !letterClosed){ flush(); letterClosed=true; }
-        if(offF>=6*u){
+        if(current && offF >= 1.8*u && !letterClosed){
+          flush(); letterClosed=true;
+        }
+        if(offF >= 6*u){
           if(!ready) pendingWordGap=true;
           addSpace();
         }
       } else {
-        if(offF>=30) pendingWordGap=true;
+        if(offF >= 30) pendingWordGap=true;
       }
     }
-  }
 
-  function loop(){
-    const st = readStats();
-    if(!st) return;
-
-    const contrast = Math.max(0, st.p90 - st.p10);
-    const score = st.mean + K_CONTRAST*contrast;
-
-    // dibuja ROI pequeño
+    // dibuja ROI
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
     ctxU.lineWidth=2;
-    ctxU.strokeRect(roi.x,roi.y,ROI_DRAW,ROI_DRAW);
-
-    // ===== WAIT_SIGNAL robusto =====
-    if(WAIT_SIGNAL){
-      baseMinScore = minHold(baseMinScore, score);
-      baseMinContrast = minHold(baseMinContrast, contrast);
-
-      const onByScore = (score - baseMinScore) > START_SCORE_DELTA;
-      const onByContrast = (contrast - baseMinContrast) > START_CONTRAST_DELTA;
-
-      if(onByScore || onByContrast) startCount++;
-      else startCount = 0;
-
-      if(startCount >= START_FRAMES){
-        // Enganchado: arranque limpio de decoder
-        WAIT_SIGNAL = false;
-        resetSession(true);          // aquí sí reseteamos aprendizaje para empezar perfecto
-        offLevel = baseMinScore;
-        onLevel = baseMinScore + 25;
-      }
-      return;
-    }
-
-    processDecoder(score);
+    ctxU.strokeRect(roi.x, roi.y, ROI_DRAW, ROI_DRAW);
   }
 
   function startLoop(){
-    WAIT_SIGNAL = true;
-    startCount = 0;
-    baseMinScore = null;
-    baseMinContrast = null;
-    resetSession(true);
+    resetSession(false);
+    fast=null; slow=null;
+    stableOn=false;
 
     if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
-      const step=()=>{ loop(); v.requestVideoFrameCallback(step); };
+      const step=()=>{ process(); v.requestVideoFrameCallback(step); };
       v.requestVideoFrameCallback(step);
     } else {
-      const step=()=>{ loop(); requestAnimationFrame(step); };
+      const step=()=>{ process(); requestAnimationFrame(step); };
       step();
     }
   }
 
-  navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
+  navigator.mediaDevices.getUserMedia({ video:{ facingMode:"environment" }, audio:false })
     .then(stream=>{
       v.srcObject=stream;
       v.onloadedmetadata=()=>{ v.play(); startLoop(); };
