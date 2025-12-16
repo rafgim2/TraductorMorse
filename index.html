@@ -7,11 +7,7 @@
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
-  canvas{
-    position:fixed;
-    inset:0;
-    touch-action:none; /* ← CLAVE para drag en móvil */
-  }
+  canvas{position:fixed;inset:0;touch-action:none}
   #out{
     position:fixed;left:12px;right:12px;bottom:12px;
     padding:10px 12px;
@@ -20,6 +16,7 @@
     background:rgba(0,0,0,.6);
     color:#7CFF9D;
     font:20px/1.3 system-ui;
+    white-space:pre-wrap;
   }
 </style>
 </head>
@@ -31,136 +28,190 @@
 
 <script>
 (() => {
+  const UNIT = 250;          // como tu emisor
+  const ROI = 24;            // cuadrado pequeño (CSS px)
+  const PATCH = 7;           // parche 7x7 para brillo (robusto)
 
-const UNIT = 250;
-const ROI = 24; // cuadrado pequeño
-const MORSE = {
-".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
-"--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
-"--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
-"...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
-"-.--":"Y","--..":"Z",
-"-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
-".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
-};
-
-const v = document.getElementById("v");
-const ui = document.getElementById("ui");
-const ctx = ui.getContext("2d");
-const out = document.getElementById("out");
-
-/* Canvas de lectura fuera de pantalla */
-const cv = document.createElement("canvas");
-const ctxV = cv.getContext("2d",{willReadFrequently:true});
-
-function resize(){
-  ui.width = cv.width = innerWidth;
-  ui.height = cv.height = innerHeight;
-}
-addEventListener("resize", resize);
-resize();
-
-/* ROI en CSS pixels */
-let roi = { x: 80, y: 80 };
-let drag=false, dx=0, dy=0;
-
-ui.addEventListener("pointerdown", e=>{
-  if(e.clientX>=roi.x && e.clientX<=roi.x+ROI &&
-     e.clientY>=roi.y && e.clientY<=roi.y+ROI){
-    drag=true;
-    dx=e.clientX-roi.x;
-    dy=e.clientY-roi.y;
-    ui.setPointerCapture(e.pointerId);
-  }
-});
-ui.addEventListener("pointermove", e=>{
-  if(!drag) return;
-  roi.x=e.clientX-dx;
-  roi.y=e.clientY-dy;
-});
-ui.addEventListener("pointerup", ()=>drag=false);
-ui.addEventListener("pointercancel", ()=>drag=false);
-
-/* LEE PIXEL CENTRAL – SINCRONIZADO */
-function readPixel(){
-  ctxV.drawImage(v,0,0,cv.width,cv.height);
-  const x = Math.floor(roi.x + ROI/2);
-  const y = Math.floor(roi.y + ROI/2);
-  const d = ctxV.getImageData(x,y,1,1).data;
-  return 0.2126*d[0] + 0.7152*d[1] + 0.0722*d[2];
-}
-
-/* DECODER */
-let lastOn=false;
-let lastT=performance.now();
-let ref=null;
-let current="", text="";
-
-function flush(){
-  if(current){
-    text+=MORSE[current]||"�";
-    out.textContent=text;
-    current="";
-  }
-}
-
-function processFrame(){
-  const lum = readPixel();
-  if(ref===null) ref=lum;
-
-  const on = lum > ref + 15; // umbral simple y robusto
-  const now = performance.now();
-
-  if(on!==lastOn){
-    const dt = now-lastT;
-    lastT=now;
-
-    if(lastOn && !on){
-      current += dt < 2*UNIT ? "." : "-";
-    }
-
-    if(!lastOn && on){
-      if(dt >= 7*UNIT){ flush(); text+=" "; }
-      else if(dt >= 3*UNIT){ flush(); }
-      out.textContent=text;
-    }
-
-    lastOn=on;
-    ref=lum;
-  }
-
-  ctx.clearRect(0,0,ui.width,ui.height);
-  ctx.strokeStyle="rgba(0,255,120,.9)";
-  ctx.lineWidth=2;
-  ctx.strokeRect(roi.x,roi.y,ROI,ROI);
-}
-
-/* LOOP sincronizado al vídeo */
-function startLoop(){
-  if ("requestVideoFrameCallback" in HTMLVideoElement.prototype){
-    const step = () => {
-      processFrame();
-      v.requestVideoFrameCallback(step);
-    };
-    v.requestVideoFrameCallback(step);
-  } else {
-    const step = () => {
-      processFrame();
-      requestAnimationFrame(step);
-    };
-    step();
-  }
-}
-
-navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
-.then(s=>{
-  v.srcObject=s;
-  v.onloadedmetadata=()=>{
-    v.play();
-    startLoop();
+  const MORSE = {
+    ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
+    "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
+    "--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
+    "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
+    "-.--":"Y","--..":"Z",
+    "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
+    ".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
   };
-})
-.catch(()=>out.textContent="No se pudo acceder a la cámara");
+
+  const v = document.getElementById("v");
+  const ui = document.getElementById("ui");
+  const ctxU = ui.getContext("2d");
+  const out = document.getElementById("out");
+
+  // Canvas de lectura offscreen (no se ve)
+  const cv = document.createElement("canvas");
+  const ctxV = cv.getContext("2d", { willReadFrequently:true });
+
+  function resize(){
+    ui.width = innerWidth;
+    ui.height = innerHeight;
+    cv.width = innerWidth;
+    cv.height = innerHeight;
+  }
+  addEventListener("resize", resize);
+  resize();
+
+  // ROI en CSS px
+  let roi = { x: 80, y: 80 };
+  let dragging=false, dx=0, dy=0;
+
+  ui.addEventListener("pointerdown", (e)=>{
+    if (e.clientX>=roi.x && e.clientX<=roi.x+ROI &&
+        e.clientY>=roi.y && e.clientY<=roi.y+ROI){
+      dragging=true;
+      dx=e.clientX-roi.x;
+      dy=e.clientY-roi.y;
+      ui.setPointerCapture(e.pointerId);
+    }
+  });
+  ui.addEventListener("pointermove", (e)=>{
+    if(!dragging) return;
+    roi.x = e.clientX - dx;
+    roi.y = e.clientY - dy;
+  });
+  ui.addEventListener("pointerup", ()=>dragging=false);
+  ui.addEventListener("pointercancel", ()=>dragging=false);
+
+  // Dibuja el vídeo en cv reproduciendo EXACTAMENTE object-fit: cover
+  function drawVideoCover(){
+    const W = cv.width, H = cv.height;
+    const vw = v.videoWidth, vh = v.videoHeight;
+    if (!vw || !vh) return false;
+
+    // cover: escala por el max de ratios
+    const scale = Math.max(W / vw, H / vh);
+    const dw = vw * scale;
+    const dh = vh * scale;
+    const dx = (W - dw) / 2;
+    const dy = (H - dh) / 2;
+
+    ctxV.clearRect(0,0,W,H);
+    ctxV.drawImage(v, dx, dy, dw, dh);
+    return true;
+  }
+
+  // Luminancia media de un parche PATCHxPATCH en el centro del ROI
+  function readLuminance(){
+    if (!drawVideoCover()) return null;
+
+    const cx = Math.floor(roi.x + ROI/2);
+    const cy = Math.floor(roi.y + ROI/2);
+
+    const half = Math.floor(PATCH/2);
+    const x = Math.max(0, Math.min(cv.width-1, cx-half));
+    const y = Math.max(0, Math.min(cv.height-1, cy-half));
+    const w = Math.min(PATCH, cv.width - x);
+    const h = Math.min(PATCH, cv.height - y);
+
+    const data = ctxV.getImageData(x,y,w,h).data;
+    let sum = 0;
+    for(let i=0;i<data.length;i+=4){
+      const r=data[i], g=data[i+1], b=data[i+2];
+      sum += 0.2126*r + 0.7152*g + 0.0722*b;
+    }
+    return sum / (data.length/4); // 0..255 aprox
+  }
+
+  // ===== Decoder (mismo esquema que tu emisor) =====
+  let lastOn = false;
+  let lastT = performance.now();
+  let current = "";
+  let text = "";
+
+  // niveles adaptativos on/off
+  let offLevel = null;
+  let onLevel  = null;
+
+  function flushLetter(){
+    if (!current) return;
+    text += (MORSE[current] ?? "�");
+    out.textContent = text;
+    current = "";
+  }
+  function addSpace(){
+    if (!text.endsWith(" ")){
+      text += " ";
+      out.textContent = text;
+    }
+  }
+
+  function classifyDotDash(dt){
+    // dot=1u, dash=3u -> umbral en 2u con tolerancia
+    return (dt < 2.0 * UNIT) ? "." : "-";
+  }
+
+  function processFrame(){
+    const lum = readLuminance();
+    if (lum == null) return;
+
+    // init niveles
+    if (offLevel == null) offLevel = lum;
+    if (onLevel  == null) onLevel  = lum;
+
+    // umbral entre niveles
+    const thr = (offLevel + onLevel) / 2;
+
+    // estado con histéresis suave (para que no baile)
+    const hyster = 6; // en escala 0..255 aprox
+    const isOn = lastOn ? (lum > thr - hyster) : (lum > thr + hyster);
+
+    // actualiza niveles según estado
+    const a = 0.08; // velocidad de adaptación
+    if (isOn) onLevel  = onLevel  + a * (lum - onLevel);
+    else      offLevel = offLevel + a * (lum - offLevel);
+
+    const now = performance.now();
+
+    if (isOn !== lastOn){
+      const dt = now - lastT;
+      lastT = now;
+
+      if (lastOn && !isOn){
+        // ON -> OFF: símbolo
+        current += classifyDotDash(dt);
+      }
+
+      if (!lastOn && isOn){
+        // OFF -> ON: gap (aquí cerramos, igual que tu codificador)
+        if (dt >= 7 * UNIT) { flushLetter(); addSpace(); }
+        else if (dt >= 3 * UNIT) { flushLetter(); }
+      }
+
+      lastOn = isOn;
+    }
+
+    // dibuja cuadrado
+    ctxU.clearRect(0,0,ui.width,ui.height);
+    ctxU.strokeStyle = "rgba(0,255,120,.9)";
+    ctxU.lineWidth = 2;
+    ctxU.strokeRect(roi.x, roi.y, ROI, ROI);
+  }
+
+  function startLoop(){
+    if ("requestVideoFrameCallback" in HTMLVideoElement.prototype){
+      const step = () => { processFrame(); v.requestVideoFrameCallback(step); };
+      v.requestVideoFrameCallback(step);
+    } else {
+      const step = () => { processFrame(); requestAnimationFrame(step); };
+      step();
+    }
+  }
+
+  navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
+    .then(stream=>{
+      v.srcObject = stream;
+      v.onloadedmetadata = ()=>{ v.play(); startLoop(); };
+    })
+    .catch(()=> out.textContent = "No se pudo acceder a la cámara (usa https o localhost).");
 
 })();
 </script>
