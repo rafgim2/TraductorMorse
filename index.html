@@ -28,180 +28,274 @@
 
 <script>
 (() => {
+  // === Igual que tu emisor ===
+  const UNIT = 250;
 
-const UNIT = 250;
-const ROI = 24;
-const PATCH = 7;
-const DEBOUNCE = 0.5 * UNIT;
+  // UI mínima
+  const ROI = 24;       // cuadrado pequeño (CSS px)
+  const PATCH = 9;      // parche pequeño y robusto
+  const DEBOUNCE = 0.45 * UNIT;
 
-const MORSE = {
-".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
-"--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
-"--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
-"...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
-"-.--":"Y","--..":"Z",
-"-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
-".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
-};
+  // Armado/calibración
+  const CALIB_MS = 900; // tiempo para estabilizar autoexposición/ruido
+  const MIN_ON_MS = 0.55 * UNIT; // ON real mínimo para "arrancar"
 
-const v = document.getElementById("v");
-const ui = document.getElementById("ui");
-const ctxU = ui.getContext("2d");
-const out = document.getElementById("out");
+  const MORSE = {
+    ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
+    "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
+    "--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
+    "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
+    "-.--":"Y","--..":"Z",
+    "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
+    ".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
+  };
 
-// offscreen canvas
-const cv = document.createElement("canvas");
-const ctxV = cv.getContext("2d",{willReadFrequently:true});
+  const v = document.getElementById("v");
+  const ui = document.getElementById("ui");
+  const ctxU = ui.getContext("2d");
+  const out = document.getElementById("out");
 
-function resize(){
-  ui.width = cv.width = innerWidth;
-  ui.height = cv.height = innerHeight;
-}
-addEventListener("resize", resize);
-resize();
+  // offscreen canvas para lectura
+  const cv = document.createElement("canvas");
+  const ctxV = cv.getContext("2d",{willReadFrequently:true});
 
-// ROI drag
-let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
-
-ui.addEventListener("pointerdown",e=>{
-  if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI &&
-     e.clientY>=roi.y&&e.clientY<=roi.y+ROI){
-    dragging=true;
-    dx=e.clientX-roi.x;
-    dy=e.clientY-roi.y;
-    ui.setPointerCapture(e.pointerId);
+  function resize(){
+    ui.width = cv.width = innerWidth;
+    ui.height = cv.height = innerHeight;
   }
-});
-ui.addEventListener("pointermove",e=>{
-  if(!dragging)return;
-  roi.x=e.clientX-dx;
-  roi.y=e.clientY-dy;
-});
-ui.addEventListener("pointerup",()=>dragging=false);
-ui.addEventListener("pointercancel",()=>dragging=false);
+  addEventListener("resize", resize);
+  resize();
 
-// draw video with cover
-function drawCover(){
-  const W=cv.width,H=cv.height;
-  const vw=v.videoWidth,vh=v.videoHeight;
-  if(!vw||!vh)return false;
-  const s=Math.max(W/vw,H/vh);
-  const dw=vw*s, dh=vh*s;
-  const dx=(W-dw)/2, dy=(H-dh)/2;
-  ctxV.drawImage(v,dx,dy,dw,dh);
-  return true;
-}
+  // ROI arrastrable (CSS px)
+  let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
 
-// read patch luminance
-function readLum(){
-  if(!drawCover())return null;
-  const cx=Math.floor(roi.x+ROI/2);
-  const cy=Math.floor(roi.y+ROI/2);
-  const h=Math.floor(PATCH/2);
-  const data=ctxV.getImageData(cx-h,cy-h,PATCH,PATCH).data;
-  let sum=0;
-  for(let i=0;i<data.length;i+=4){
-    sum+=0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2];
+  ui.addEventListener("pointerdown",e=>{
+    if(e.clientX>=roi.x && e.clientX<=roi.x+ROI &&
+       e.clientY>=roi.y && e.clientY<=roi.y+ROI){
+      dragging=true;
+      dx=e.clientX-roi.x; dy=e.clientY-roi.y;
+      ui.setPointerCapture(e.pointerId);
+    }
+  });
+  ui.addEventListener("pointermove",e=>{
+    if(!dragging) return;
+    roi.x=e.clientX-dx;
+    roi.y=e.clientY-dy;
+  });
+  ui.addEventListener("pointerup",()=>dragging=false);
+  ui.addEventListener("pointercancel",()=>dragging=false);
+
+  // Dibuja el vídeo en cv como cover (igual que lo ves)
+  function drawCover(){
+    const W=cv.width,H=cv.height;
+    const vw=v.videoWidth,vh=v.videoHeight;
+    if(!vw||!vh) return false;
+
+    const s=Math.max(W/vw,H/vh);
+    const dw=vw*s, dh=vh*s;
+    const ox=(W-dw)/2, oy=(H-dh)/2;
+
+    ctxV.clearRect(0,0,W,H);
+    ctxV.drawImage(v, ox, oy, dw, dh);
+    return true;
   }
-  return sum/(data.length/4);
-}
 
-// decoder
-let lastStableOn=false;
-let candidateOn=false;
-let candidateSince=performance.now();
-let lastTransition=performance.now();
-let current="", text="";
-let offLevel=null,onLevel=null;
-let letterClosed=false, spaceAdded=false;
+  // Luminancia media de parche PATCHxPATCH centrado en ROI
+  function readLum(){
+    if(!drawCover()) return null;
+    const cx=Math.floor(roi.x+ROI/2);
+    const cy=Math.floor(roi.y+ROI/2);
+    const h=Math.floor(PATCH/2);
 
-function flushLetter(){
-  if(current){
-    text+=MORSE[current]||"�";
-    out.textContent=text;
+    const x=Math.max(0, Math.min(cv.width-PATCH, cx-h));
+    const y=Math.max(0, Math.min(cv.height-PATCH, cy-h));
+
+    const data=ctxV.getImageData(x,y,PATCH,PATCH).data;
+    let sum=0;
+    for(let i=0;i<data.length;i+=4){
+      sum += 0.2126*data[i] + 0.7152*data[i+1] + 0.0722*data[i+2];
+    }
+    return sum/(data.length/4); // 0..255
+  }
+
+  // ===== Decoder con armado =====
+  let offLevel=null, onLevel=null;
+
+  let lastStableOn=false;
+  let candidateOn=false;
+  let candidateSince=performance.now();
+  let lastTransition=performance.now();
+
+  let current="", text="";
+  let letterClosed=false, spaceAdded=false;
+
+  let startTs=performance.now();
+  let armed=false;     // NO decodificar hasta estar armado
+  let seenFirstOn=false;
+
+  function resetDecoder(){
+    current=""; text="";
+    out.textContent="";
+    lastStableOn=false;
+    candidateOn=false;
+    candidateSince=performance.now();
+    lastTransition=performance.now();
+    letterClosed=false;
+    spaceAdded=false;
+    armed=false;
+    seenFirstOn=false;
+    startTs=performance.now();
+    offLevel=null; onLevel=null;
+  }
+
+  function flushLetter(){
+    if(!current) return;
+    text += (MORSE[current] ?? "�");
+    out.textContent = text;
     current="";
   }
-}
-
-function loop(){
-  const lum=readLum();
-  if(lum==null)return;
-
-  if(offLevel==null){ offLevel=onLevel=lum; }
-
-  const thr=(offLevel+onLevel)/2;
-  const rawOn = lum > thr;
-
-  // debounce
-  if(rawOn!==candidateOn){
-    candidateOn=rawOn;
-    candidateSince=performance.now();
-  }
-
-  const now=performance.now();
-  if(now-candidateSince>=DEBOUNCE && candidateOn!==lastStableOn){
-    const dt=now-lastTransition;
-    lastTransition=now;
-
-    if(lastStableOn && !candidateOn){
-      current += dt < 2*UNIT ? "." : "-";
-      letterClosed=false;
-      spaceAdded=false;
-    }
-
-    if(!lastStableOn && candidateOn){
-      if(dt>=7*UNIT){ flushLetter(); text+=" "; spaceAdded=true; }
-      else if(dt>=3*UNIT){ flushLetter(); letterClosed=true; }
-      out.textContent=text;
-    }
-
-    lastStableOn=candidateOn;
-  }
-
-  // close at end (OFF without next ON)
-  if(!lastStableOn){
-    const offTime=now-lastTransition;
-    if(offTime>=3*UNIT && current && !letterClosed){
-      flushLetter();
-      letterClosed=true;
-    }
-    if(offTime>=7*UNIT && !spaceAdded){
-      text+=" ";
-      out.textContent=text;
-      spaceAdded=true;
+  function addSpace(){
+    if(text && !text.endsWith(" ")){
+      text += " ";
+      out.textContent = text;
     }
   }
 
-  // adapt levels
-  const a=0.05;
-  if(lastStableOn) onLevel+=a*(lum-onLevel);
-  else offLevel+=a*(lum-offLevel);
+  function tick(){
+    const lum=readLum();
+    if(lum==null) return;
 
-  // draw ROI
-  ctxU.clearRect(0,0,ui.width,ui.height);
-  ctxU.strokeStyle="rgba(0,255,120,.9)";
-  ctxU.lineWidth=2;
-  ctxU.strokeRect(roi.x,roi.y,ROI,ROI);
-}
+    // Inicializa niveles
+    if(offLevel==null){
+      offLevel=lum;
+      onLevel=lum+1;
+    }
 
-function start(){
-  if("requestVideoFrameCallback"in HTMLVideoElement.prototype){
-    const step=()=>{loop();v.requestVideoFrameCallback(step);};
-    v.requestVideoFrameCallback(step);
-  }else{
-    const step=()=>{loop();requestAnimationFrame(step);};
-    step();
+    const now=performance.now();
+
+    // Durante CALIB_MS solo aprendemos "OFF" (sin decodificar)
+    if(!armed){
+      // Consideramos que al principio el beacon está OFF: seguimos offLevel
+      offLevel += 0.10*(lum-offLevel);
+      // onLevel lo dejamos separado para que el umbral no sea NaN
+      onLevel = Math.max(onLevel, offLevel + 30);
+
+      if(now - startTs >= CALIB_MS){
+        armed = true;
+        // seguimos esperando primer ON real para empezar a contar tiempos
+        lastTransition = now;
+        lastStableOn = false;
+      }
+      drawROI();
+      return;
+    }
+
+    // Umbral entre niveles + histéresis
+    const thr=(offLevel+onLevel)/2;
+    const hyster=8;
+    const rawOn = lastStableOn ? (lum > thr - hyster) : (lum > thr + hyster);
+
+    // Debounce: no aceptamos cambios instantáneos
+    if(rawOn !== candidateOn){
+      candidateOn = rawOn;
+      candidateSince = now;
+    }
+
+    // Si el candidato lleva estable DEBOUNCE, aceptamos cambio
+    if((now - candidateSince) >= DEBOUNCE && candidateOn !== lastStableOn){
+      const dt = now - lastTransition;
+      lastTransition = now;
+
+      // Antes de empezar a decodificar, exigimos ver un ON real
+      if(!seenFirstOn){
+        if(candidateOn === true && dt >= MIN_ON_MS){
+          seenFirstOn = true;
+          // Reset tiempos desde aquí
+          lastStableOn = true;
+          // actualiza onLevel con lo que vemos en ON
+          onLevel += 0.25*(lum-onLevel);
+        } else {
+          // seguimos sin empezar
+          lastStableOn = candidateOn;
+        }
+        drawROI();
+        return;
+      }
+
+      // Ya estamos decodificando
+      if(lastStableOn && !candidateOn){
+        // ON -> OFF: símbolo
+        current += (dt < 2*UNIT) ? "." : "-";
+        letterClosed=false; spaceAdded=false;
+        // actualiza onLevel
+        onLevel += 0.15*(lum-onLevel);
+      }
+
+      if(!lastStableOn && candidateOn){
+        // OFF -> ON: gap (cierra letra/palabra igual que tu emisor)
+        if(dt >= 7*UNIT){ flushLetter(); addSpace(); spaceAdded=true; }
+        else if(dt >= 3*UNIT){ flushLetter(); letterClosed=true; }
+        // actualiza offLevel (venimos de OFF)
+        offLevel += 0.15*(lum-offLevel);
+      }
+
+      lastStableOn = candidateOn;
+    }
+
+    // Cierre por silencio final (cuando no vuelve ON)
+    if(seenFirstOn && !lastStableOn){
+      const offTime = now - lastTransition;
+      if(offTime >= 3*UNIT && current && !letterClosed){
+        flushLetter();
+        letterClosed=true;
+      }
+      if(offTime >= 7*UNIT && !spaceAdded){
+        addSpace();
+        spaceAdded=true;
+      }
+    }
+
+    // Adaptación continua de niveles
+    const a=0.04;
+    if(lastStableOn) onLevel += a*(lum-onLevel);
+    else offLevel += a*(lum-offLevel);
+
+    // Mantén separación mínima
+    if(onLevel < offLevel + 20) onLevel = offLevel + 20;
+
+    drawROI();
   }
-}
 
-navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
-.then(s=>{
-  v.srcObject=s;
-  v.onloadedmetadata=()=>{v.play();start();};
-})
-.catch(()=>out.textContent="No se pudo acceder a la cámara");
+  function drawROI(){
+    ctxU.clearRect(0,0,ui.width,ui.height);
+    ctxU.strokeStyle="rgba(0,255,120,.9)";
+    ctxU.lineWidth=2;
+    ctxU.strokeRect(roi.x,roi.y,ROI,ROI);
+  }
+
+  function startLoop(){
+    // resetea al arrancar cámara
+    resetDecoder();
+
+    if ("requestVideoFrameCallback" in HTMLVideoElement.prototype){
+      const step = () => { tick(); v.requestVideoFrameCallback(step); };
+      v.requestVideoFrameCallback(step);
+    } else {
+      const step = () => { tick(); requestAnimationFrame(step); };
+      step();
+    }
+  }
+
+  navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
+    .then(stream=>{
+      v.srcObject = stream;
+      v.onloadedmetadata = ()=>{ v.play(); startLoop(); };
+    })
+    .catch(()=> out.textContent="No se pudo acceder a la cámara (usa https o localhost).");
 
 })();
 </script>
 </body>
 </html>
+
+
