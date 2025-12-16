@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (wait signal)</title>
+<title>Morse Decoder (enganche robusto)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -28,20 +28,23 @@
 
 <script>
 (() => {
-  const ROI_DRAW = 24;
-  const ROI_READ = 64;
+  // UI
+  const ROI_DRAW = 24;     // cuadrado visible
+  const ROI_READ = 72;     // zona real analizada (más fácil)
   const SAMPLE_STEP = 4;
   const K_CONTRAST = 0.85;
 
-  // “Enganche” de señal
-  const START_ON_FRAMES = 6;   // cuántos frames seguidos ON para considerar que empezó
-  const START_DELTA = 10;      // cuánto debe subir el score sobre baseline para ser ON (aprox)
+  // Enganche (inicio señal)
+  const START_FRAMES = 7;        // ON consecutivos para enganchar
+  const START_SCORE_DELTA = 14;  // subida de score vs baselineMin
+  const START_CONTRAST_DELTA = 18; // subida de contraste vs baselineMinContrast
 
+  // Morse
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
     "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
     "--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
-    "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
+    "...":"S","-":"T","..":"U","...-":"V",".--":"W","-..-":"X",
     "-.--":"Y","--..":"Z",
     "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
     ".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
@@ -52,6 +55,7 @@
   const ctxU = ui.getContext("2d");
   const out = document.getElementById("out");
 
+  // offscreen
   const cv = document.createElement("canvas");
   const ctxV = cv.getContext("2d",{willReadFrequently:true});
 
@@ -62,7 +66,7 @@
   addEventListener("resize", resize);
   resize();
 
-  // ROI drag (dibujado pequeño)
+  // ROI drag
   let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
   ui.addEventListener("pointerdown",e=>{
     if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI_DRAW &&
@@ -89,7 +93,8 @@
     return true;
   }
 
-  function readScore(){
+  // stats en ROI_READ: mean, p10, p90
+  function readStats(){
     if(!drawCover()) return null;
 
     const cx=Math.floor(roi.x+ROI_DRAW/2);
@@ -108,7 +113,7 @@
       for(let xx=0; xx<ROI_READ; xx+=SAMPLE_STEP){
         const i=(yy*ROI_READ+xx)*4;
         const r=img[i], g=img[i+1], b=img[i+2];
-        const lum = (0.2126*r + 0.7152*g + 0.0722*b) | 0;
+        const lum=(0.2126*r+0.7152*g+0.0722*b)|0;
         sum += lum;
         bins[lum>>2]++;
         count++;
@@ -119,45 +124,57 @@
 
     let acc=0;
     const p10T=count*0.10, p90T=count*0.90;
-    let p10=0,p90=255;
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){p10=bi<<2; break;} }
-    acc=0;
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){p90=bi<<2; break;} }
+    let p10=0, p90=255;
 
-    const contrast = Math.max(0, p90-p10);
-    return mean + K_CONTRAST*contrast;
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){ p10=bi<<2; break; } }
+    acc=0;
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){ p90=bi<<2; break; } }
+
+    return { mean, p10, p90 };
   }
 
-  // ===== Estado global =====
+  // ===== Estado “enganche robusto” =====
   let WAIT_SIGNAL = true;
-  let baseline = null;
-  let startOnCount = 0;
+  let startCount = 0;
 
-  // Decoder state
+  // En vez de baseline EMA (que se mueve), guardamos mínimos “lentos”
+  let baseMinScore = null;
+  let baseMinContrast = null;
+
+  // Filtro de mínimo con “subida lenta”: si el mínimo real desaparece, sube despacio,
+  // pero nunca se dispara hacia arriba rápido (justo lo que te estaba fastidiando).
+  function minHold(currentMin, x){
+    if(currentMin == null) return x;
+    if(x < currentMin) return x;
+    return currentMin + 0.01*(x - currentMin); // sube MUY lento
+  }
+
+  // ===== Decoder por frames + sesión =====
   let offLevel=null,onLevel=null, stableOn=false;
   let onF=0, offF=0, current="", text="", letterClosed=false;
+
   const dots=[];
-
-  let ready=false, lastU=null, stableUCount=0;
-  let pendingWordGap=false, armed=false;
-
-  function resetSession(keepLearning=true){
-    current=""; text=""; out.textContent="";
-    letterClosed=false;
-    onF=0; offF=0; stableOn=false;
-    pendingWordGap=false; armed=false;
-
-    if(!keepLearning){
-      dots.length=0;
-      ready=false; lastU=null; stableUCount=0;
-    }
-  }
-
   function pushDot(n){ dots.push(n); if(dots.length>30) dots.shift(); }
   function dotUnit(){
     if(dots.length<8) return null;
     const s=[...dots].sort((a,b)=>a-b);
     return s[Math.floor(s.length/2)];
+  }
+
+  let ready=false, lastU=null, stableUCount=0;
+  let pendingWordGap=false, armed=false;
+
+  function resetSession(resetLearning){
+    current=""; text=""; out.textContent="";
+    letterClosed=false;
+    onF=0; offF=0; stableOn=false;
+    pendingWordGap=false; armed=false;
+
+    if(resetLearning){
+      dots.length=0;
+      ready=false; lastU=null; stableUCount=0;
+      offLevel=null; onLevel=null;
+    }
   }
 
   function updateReady(u){
@@ -212,6 +229,7 @@
       if(!stableOn){
         const u=dotUnit();
         updateReady(u);
+
         if(!ready && offF>=30) pendingWordGap=true;
 
         if(u){
@@ -238,8 +256,10 @@
     updateReady(u);
 
     if(!stableOn){
-      if(u && offF>=12*u){ resetSession(true); } // fin sesión
-      if(!u && offF>=140){ resetSession(true); }
+      if((u && offF>=12*u) || (!u && offF>=140)){
+        // fin de sesión: listo para la próxima emisión
+        resetSession(false); // NO resetear aprendizaje: así la segunda va aún más fina
+      }
 
       if(u){
         if(current && offF>=1.8*u && !letterClosed){ flush(); letterClosed=true; }
@@ -254,29 +274,35 @@
   }
 
   function loop(){
-    const score = readScore();
-    if(score==null) return;
+    const st = readStats();
+    if(!st) return;
 
-    // dibuja ROI
+    const contrast = Math.max(0, st.p90 - st.p10);
+    const score = st.mean + K_CONTRAST*contrast;
+
+    // dibuja ROI pequeño
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
     ctxU.lineWidth=2;
     ctxU.strokeRect(roi.x,roi.y,ROI_DRAW,ROI_DRAW);
 
-    // ===== WAIT_SIGNAL: no aprender ni decodificar hasta ver ON real =====
+    // ===== WAIT_SIGNAL robusto =====
     if(WAIT_SIGNAL){
-      if(baseline==null) baseline=score;
-      baseline = baseline + 0.05*(score-baseline); // baseline OFF
+      baseMinScore = minHold(baseMinScore, score);
+      baseMinContrast = minHold(baseMinContrast, contrast);
 
-      if(score > baseline + START_DELTA) startOnCount++;
-      else startOnCount = 0;
+      const onByScore = (score - baseMinScore) > START_SCORE_DELTA;
+      const onByContrast = (contrast - baseMinContrast) > START_CONTRAST_DELTA;
 
-      if(startOnCount >= START_ON_FRAMES){
-        // señal empezó: arranque limpio
+      if(onByScore || onByContrast) startCount++;
+      else startCount = 0;
+
+      if(startCount >= START_FRAMES){
+        // Enganchado: arranque limpio de decoder
         WAIT_SIGNAL = false;
-        resetSession(false); // resetea aprendizaje también para empezar fino
-        offLevel = baseline;
-        onLevel = baseline + 25;
+        resetSession(true);          // aquí sí reseteamos aprendizaje para empezar perfecto
+        offLevel = baseMinScore;
+        onLevel = baseMinScore + 25;
       }
       return;
     }
@@ -286,11 +312,10 @@
 
   function startLoop(){
     WAIT_SIGNAL = true;
-    baseline = null;
-    startOnCount = 0;
-
-    resetSession(false);
-    offLevel=null; onLevel=null;
+    startCount = 0;
+    baseMinScore = null;
+    baseMinContrast = null;
+    resetSession(true);
 
     if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
       const step=()=>{ loop(); v.requestVideoFrameCallback(step); };
@@ -311,7 +336,3 @@
 </script>
 </body>
 </html>
-
-
-
-
