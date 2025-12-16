@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Morse Beacon Reader (Scramble)</title>
+  <style>
+    html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#eaeaea;}
+    .wrap{position:relative;width:100vw;height:100vh;}
+    video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+    canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
+
+    .start{
+      position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+      background:rgba(0,0,0,.55);text-align:center;padding:24px;
+    }
+    .start button{
+      background:#1f1f1f;border:1px solid #3a3a3a;color:#eaeaea;border-radius:14px;
+      padding:12px 16px;font-size:16px;cursor:pointer;
+    }
+    .start p{margin:10px 0 0;opacity:.8;font-size:13px;line-height:1.35}
+
+    .hud{
+      position:absolute;left:12px;right:12px;bottom:12px;
+      background:rgba(0,0,0,.55);
+      border:1px solid rgba(255,255,255,.15);
+      border-radius:16px;padding:10px 12px;
+      backdrop-filter:blur(6px);
+    }
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+    .pill{padding:3px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.35);font-size:13px;opacity:.9}
+    button.small{
+      background:#222;border:1px solid #333;color:#eaeaea;border-radius:12px;
+      padding:8px 10px;font-size:14px;cursor:pointer;
+    }
+    .mono{font-family:ui-monospace,Menlo,Consolas,monospace;}
+    .big{font-size:22px;white-space:pre-wrap;word-break:break-word;line-height:1.3}
+    .sub{opacity:.75;font-size:13px}
+  </style>
+</head>
+
+<body>
+<div class="wrap">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="ui"></canvas>
+
+  <div id="startOverlay" class="start">
+    <div>
+      <button id="btnStart">Toca para iniciar la cámara</button>
+      <p>Coloca el beacon dentro del marco. Consejo: unidad 200–300 ms (250 ms recomendado).</p>
+    </div>
+  </div>
+
+  <div class="hud">
+    <div class="row">
+      <span id="state" class="pill">Estado: —</span>
+      <span id="level" class="pill mono">L: —</span>
+      <span id="thr" class="pill mono">Th: —</span>
+      <button class="small" id="btnClear">Borrar</button>
+    </div>
+    <div style="margin-top:8px" class="mono sub">
+      Secuencia actual: <span id="seq">—</span>
+    </div>
+    <div style="margin-top:8px" class="mono big" id="out">(mensaje)</div>
+  </div>
+</div>
+
+<script>
+/* =========================
+   AJUSTES IMPORTANTES
+   ========================= */
+
+// Dónde está el beacon en tu vídeo (por defecto: arriba-derecha)
+const ROI = {
+  wPct: 0.42,       // ancho del marco relativo a pantalla
+  hPct: 0.25,       // alto del marco
+  xCenterPct: 0.80, // 0.80 = derecha, 0.20 = izquierda
+  yCenterPct: 0.20  // 0.20 = arriba, 0.80 = abajo
+};
+
+// Debe aproximarse a la unidad usada en el emisor (morse_beacon)
+const DOT_MS = 250;
+
+// Tolerancias
+const DOT_MAX = DOT_MS * 2.0;        // pulso ON <= esto => punto
+const DASH_MIN = DOT_MS * 2.0;       // pulso ON >= esto => raya
+const LETTER_GAP_MIN = DOT_MS * 2.2; // OFF >= esto => fin de letra
+const WORD_GAP_MIN   = DOT_MS * 5.5; // OFF >= esto => fin de palabra
+
+// Scramble
+const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789?/#@$%&*+-";
+const SCRAMBLE_STEP_MS = 35;   // velocidad de cambio de letras
+const SCRAMBLE_HOLD_MS = 220;  // cuánto dura el “glitch” antes de fijar la letra
+
+/* =========================
+   MORSE MAP
+   ========================= */
+const MORSE_TO_CHAR = {
+  ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F","--.":"G","....":"H","..":"I",
+  ".---":"J","-.-":"K",".-..":"L","--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
+  "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X","-.--":"Y","--..":"Z",
+  "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
+};
+
+/* =========================
+   ELEMENTOS
+   ========================= */
+const video = document.getElementById('video');
+const ui = document.getElementById('ui');
+const ctx = ui.getContext('2d');
+
+const startOverlay = document.getElementById('startOverlay');
+const btnStart = document.getElementById('btnStart');
+const btnClear = document.getElementById('btnClear');
+
+const elState = document.getElementById('state');
+const elLevel = document.getElementById('level');
+const elThr   = document.getElementById('thr');
+const elSeq   = document.getElementById('seq');
+const elOut   = document.getElementById('out');
+
+// Offscreen para analizar el frame (como se ve: cover)
+const frame = document.createElement('canvas');
+const fctx = frame.getContext('2d', { willReadFrequently:true });
+
+let stream = null;
+
+/* =========================
+   UI: marco
+   ========================= */
+function resize(){
+  ui.width = innerWidth; ui.height = innerHeight;
+  frame.width = innerWidth; frame.height = innerHeight;
+}
+addEventListener('resize', resize);
+resize();
+
+function roiRect(){
+  const w = Math.floor(ui.width * ROI.wPct);
+  const h = Math.floor(ui.height * ROI.hPct);
+  const x = Math.floor(ui.width * ROI.xCenterPct - w/2);
+  const y = Math.floor(ui.height * ROI.yCenterPct - h/2);
+  return { x:Math.max(0,x), y:Math.max(0,y), w, h };
+}
+
+function drawUI(){
+  ctx.clearRect(0,0,ui.width,ui.height);
+  const {x,y,w,h} = roiRect();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgba(0,255,120,0.92)";
+  ctx.strokeRect(x,y,w,h);
+  const c=18;
+  ctx.lineWidth=5;
+  ctx.beginPath(); ctx.moveTo(x,y+c); ctx.lineTo(x,y); ctx.lineTo(x+c,y); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x+w-c,y); ctx.lineTo(x+w,y); ctx.lineTo(x+w,y+c); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x,y+h-c); ctx.lineTo(x,y+h); ctx.lineTo(x+c,y+h); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x+w-c,y+h); ctx.lineTo(x+w,y+h); ctx.lineTo(x+w,y+h-c); ctx.stroke();
+}
+
+// Dibuja vídeo en frame con cover (igual que CSS object-fit:cover)
+function drawCover(){
+  const sw=frame.width, sh=frame.height;
+  const vw=video.videoWidth, vh=video.videoHeight;
+  if(!vw||!vh) return false;
+  const scale = Math.max(sw/vw, sh/vh);
+  const dw = vw*scale, dh = vh*scale;
+  const dx = (sw-dw)/2, dy = (sh-dh)/2;
+  fctx.clearRect(0,0,sw,sh);
+  fctx.drawImage(video, dx, dy, dw, dh);
+  return true;
+}
+
+// brillo medio del ROI (0..255) con muestreo
+function avgLumaInROI(){
+  const {x,y,w,h} = roiRect();
+  const img = fctx.getImageData(x,y,w,h);
+  const d = img.data;
+  let sum=0;
+  const step = 16; // 1 de cada 4 píxeles aprox
+  for(let i=0;i<d.length;i+=step){
+    const r=d[i], g=d[i+1], b=d[i+2];
+    const lum = 0.2126*r + 0.7152*g + 0.0722*b;
+    sum += lum;
+  }
+  const n = Math.floor(d.length/step) || 1;
+  return sum/n;
+}
+
+/* =========================
+   SCRAMBLE (salida letra a letra)
+   ========================= */
+let stableText = "";             // lo ya “fijado”
+let pendingQueue = [];           // caracteres por mostrar (fijar)
+let scrambling = false;
+
+function randChar(){
+  return SCRAMBLE_CHARS[Math.floor(Math.random()*SCRAMBLE_CHARS.length)];
+}
+
+function enqueueOutput(str){
+  for (const ch of str) pendingQueue.push(ch);
+  if (!scrambling) runScramble();
+}
+
+async function runScramble(){
+  scrambling = true;
+  while (pendingQueue.length > 0){
+    const ch = pendingQueue.shift();
+
+    // espacios: fijar sin efecto
+    if (ch === " "){
+      stableText += " ";
+      elOut.textContent = stableText || "(mensaje)";
+      continue;
+    }
+
+    // efecto glitch para esta letra
+    const start = performance.now();
+    while (performance.now() - start < SCRAMBLE_HOLD_MS){
+      elOut.textContent = stableText + randChar();
+      await new Promise(r => setTimeout(r, SCRAMBLE_STEP_MS));
+    }
+
+    // fijar letra real
+    stableText += ch;
+    elOut.textContent = stableText || "(mensaje)";
+  }
+  scrambling = false;
+}
+
+function clearOutput(){
+  stableText = "";
+  pendingQueue = [];
+  elOut.textContent = "(mensaje)";
+}
+
+/* =========================
+   DECODER MORSE
+   ========================= */
+let baseline = 0;
+let thr = 0;
+let isOn = false;
+let lastChange = performance.now();
+
+let currentSymbol = ""; // ".-" de la letra actual
+let seqVisible = "";    // para debug bonito
+
+function addSymbol(sym){
+  currentSymbol += sym;
+  seqVisible += sym;
+  elSeq.textContent = seqVisible || "—";
+}
+
+function commitLetter(){
+  if (!currentSymbol) return;
+  const ch = MORSE_TO_CHAR[currentSymbol] || " ";
+  enqueueOutput(ch);
+  currentSymbol = "";
+}
+
+function commitWord(){
+  commitLetter();
+  enqueueOutput(" ");
+}
+
+function updateState(nextOn){
+  const now = performance.now();
+  if (nextOn === isOn) return;
+
+  const dt = now - lastChange;
+
+  if (isOn){
+    // ON -> OFF: dt es duración del pulso
+    if (dt <= DOT_MAX) addSymbol(".");
+    else if (dt >= DASH_MIN) addSymbol("-");
+    else addSymbol("."); // zona ambigua
+  } else {
+    // OFF -> ON: dt es duración del silencio
+    if (dt >= WORD_GAP_MIN){
+      commitWord();
+      seqVisible += " / ";
+      elSeq.textContent = seqVisible || "—";
+    } else if (dt >= LETTER_GAP_MIN){
+      commitLetter();
+      seqVisible += " ";
+      elSeq.textContent = seqVisible || "—";
+    }
+  }
+
+  lastChange = now;
+  isOn = nextOn;
+}
+
+function loop(){
+  requestAnimationFrame(loop);
+
+  drawUI();
+  if (!stream) return;
+  if (!drawCover()) return;
+
+  const L = avgLumaInROI();
+
+  // baseline adaptativo (autoexposición)
+  baseline = baseline ? (baseline*0.98 + L*0.02) : L;
+  // umbral: un poco por encima del baseline
+  thr = baseline + 18;
+
+  const nextOn = (L > thr);
+
+  elLevel.textContent = `L: ${L.toFixed(1)}`;
+  elThr.textContent   = `Th: ${thr.toFixed(1)}`;
+  elState.textContent = `Estado: ${nextOn ? "ON" : "OFF"}`;
+
+  updateState(nextOn);
+
+  // cierre automático si se queda OFF mucho rato (fin de letra/palabra)
+  const now = performance.now();
+  if (!isOn){
+    const offDur = now - lastChange;
+    if (offDur >= WORD_GAP_MIN) commitWord();
+    else if (offDur >= LETTER_GAP_MIN) commitLetter();
+  }
+}
+
+btnClear.addEventListener('click', ()=>{
+  currentSymbol = "";
+  seqVisible = "";
+  elSeq.textContent = "—";
+  clearOutput();
+});
+
+btnStart.addEventListener('click', async ()=>{
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode:{ ideal:"environment" }, width:{ideal:1280}, height:{ideal:720} },
+    audio:false
+  });
+  video.srcObject = stream;
+
+  // reset decoder
+  baseline = 0; thr = 0;
+  isOn = false;
+  lastChange = performance.now();
+  currentSymbol = "";
+  seqVisible = "";
+  elSeq.textContent = "—";
+  clearOutput();
+
+  startOverlay.style.display="none";
+});
+
+loop();
+</script>
+</body>
+</html>
