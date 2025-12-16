@@ -1,252 +1,131 @@
 <!doctype html>
 <html lang="es">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Morse Decoder</title>
-  <style>
-    :root { color-scheme: dark; }
-    body { margin:0; background:#000; overflow:hidden; }
-    video { position:fixed; inset:0; width:100vw; height:100vh; object-fit:cover; transform: scaleX(-1); }
-    canvas { position:fixed; inset:0; pointer-events:none; }
-    #drag { position:fixed; inset:0; background:transparent; }
-    #out{
-      position:fixed; left:12px; right:12px; bottom:12px;
-      min-height:48px; padding:10px 12px;
-      border:1px solid rgba(0,255,120,.7);
-      border-radius:14px;
-      background: rgba(0,0,0,.55);
-      color:#7CFF9D;
-      font: 20px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      white-space:pre-wrap;
-      user-select:text;
-    }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Morse Decoder</title>
+<style>
+  body{margin:0;background:#000;overflow:hidden}
+  video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
+  canvas{position:fixed;inset:0}
+  #out{
+    position:fixed;left:10px;right:10px;bottom:10px;
+    padding:10px 12px;
+    border:1px solid rgba(0,255,120,.8);
+    border-radius:12px;
+    background:rgba(0,0,0,.6);
+    color:#7CFF9D;
+    font:20px/1.3 system-ui;
+  }
+</style>
 </head>
 <body>
-  <video id="v" autoplay playsinline muted></video>
-  <canvas id="c"></canvas>
-  <div id="drag"></div>
-  <div id="out"></div>
+
+<video id="v" autoplay playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="out"></div>
 
 <script>
 (() => {
-  // === IGUAL QUE TU EMISOR ===
-  const UNIT_MS = 250;
 
-  // === CUADRO CUADRADO Y PEQUEÑO (px exactos) ===
-  const ROI_SIZE_PX = 40; // prueba 30/40/50
+const UNIT = 250;              // EXACTO a tu emisor
+const ROI_SIZE = 32;           // ← CUADRADO REAL, PEQUEÑO
 
-  const MORSE = {
-    ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F","--.":"G","....":"H","..":"I",
-    ".---":"J","-.-":"K",".-..":"L","--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
-    "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X","-.--":"Y","--..":"Z",
-    "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
-  };
+const MORSE = {
+".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
+"--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
+"--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
+"...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
+"-.--":"Y","--..":"Z",
+"-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
+".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
+};
 
-  const v = document.getElementById("v");
-  const c = document.getElementById("c");
-  const ctx = c.getContext("2d", { willReadFrequently: true });
-  const drag = document.getElementById("drag");
-  const out = document.getElementById("out");
+const v = document.getElementById("v");
+const c = document.getElementById("c");
+const ctx = c.getContext("2d",{willReadFrequently:true});
+const out = document.getElementById("out");
 
-  const clamp = (x,a,b)=>Math.max(a,Math.min(b,x));
+let roi = { x: 40, y: 40 };    // ← EN PIXELES
+let dragging=false, dx=0, dy=0;
 
-  function syncCanvas(){
-    c.width  = Math.floor(innerWidth  * devicePixelRatio);
-    c.height = Math.floor(innerHeight * devicePixelRatio);
+function resize(){
+  c.width  = innerWidth  * devicePixelRatio;
+  c.height = innerHeight * devicePixelRatio;
+}
+addEventListener("resize", resize);
+resize();
+
+/* ===== DRAG REAL ===== */
+c.addEventListener("pointerdown", e=>{
+  const x=e.clientX*devicePixelRatio;
+  const y=e.clientY*devicePixelRatio;
+  if(x>=roi.x && x<=roi.x+ROI_SIZE &&
+     y>=roi.y && y<=roi.y+ROI_SIZE){
+    dragging=true;
+    dx=x-roi.x; dy=y-roi.y;
+    c.setPointerCapture(e.pointerId);
+  }
+});
+c.addEventListener("pointermove", e=>{
+  if(!dragging) return;
+  roi.x=e.clientX*devicePixelRatio-dx;
+  roi.y=e.clientY*devicePixelRatio-dy;
+});
+c.addEventListener("pointerup", ()=>dragging=false);
+c.addEventListener("pointercancel", ()=>dragging=false);
+
+/* ===== LUMINANCIA ===== */
+function luminance(){
+  ctx.drawImage(v,0,0,c.width,c.height);
+  const d=ctx.getImageData(roi.x,roi.y,ROI_SIZE,ROI_SIZE).data;
+  let s=0;
+  for(let i=0;i<d.length;i+=16)
+    s+=0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2];
+  return (s/(d.length/16))/255;
+}
+
+/* ===== DECODER ===== */
+let base=0,smooth=0,lastOn=false,lastT=performance.now();
+let cur="", text="";
+
+function flush(){
+  if(cur){ text+=MORSE[cur]||"�"; out.textContent=text; cur=""; }
+}
+
+function loop(){
+  const l=luminance();
+  base+=0.02*(l-base);
+  smooth+=0.25*(l-smooth);
+
+  const on = lastOn ? smooth>base+0.03 : smooth>base+0.05;
+  const now=performance.now();
+
+  if(on!==lastOn){
+    const dt=now-lastT;
+    lastT=now;
+    if(lastOn && !on)
+      cur+=dt<2*UNIT?".":"-";
+    if(!lastOn && on && dt>=3*UNIT) flush();
+    if(!lastOn && on && dt>=7*UNIT) text+=" ";
+    lastOn=on;
   }
 
-  // ROI por centro normalizado
-  let center = { x: 0.88, y: 0.18 };
+  ctx.clearRect(0,0,c.width,c.height);
+  ctx.strokeStyle="rgba(0,255,120,.9)";
+  ctx.lineWidth=3*devicePixelRatio;
+  ctx.strokeRect(roi.x,roi.y,ROI_SIZE,ROI_SIZE);
 
-  function roiRect(){
-    const w = c.width, h = c.height;
-    const s = ROI_SIZE_PX * devicePixelRatio;
-    const rx = Math.round(center.x*w - s/2);
-    const ry = Math.round(center.y*h - s/2);
-    return { w, h, s, rx, ry };
-  }
+  requestAnimationFrame(loop);
+}
 
-  function drawROI(){
-    const { w,h,s,rx,ry } = roiRect();
-    ctx.clearRect(0,0,w,h);
-    ctx.lineWidth = 3 * devicePixelRatio;
-    ctx.strokeStyle = "rgba(0,255,120,0.92)";
-    ctx.fillStyle = "rgba(0,255,120,0.10)";
-    ctx.beginPath();
-    ctx.roundRect(rx, ry, s, s, 8*devicePixelRatio);
-    ctx.fill();
-    ctx.stroke();
-  }
+/* ===== START ===== */
+navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}})
+.then(s=>{
+  v.srcObject=s;
+  v.onloadedmetadata=()=>{v.play();loop();}
+});
 
-  // Drag ROI
-  let dragging=false, offx=0, offy=0;
-  const pointerPx = (e)=>({ x:e.clientX*devicePixelRatio, y:e.clientY*devicePixelRatio });
-
-  function inside(px,py){
-    const { s,rx,ry } = roiRect();
-    return px>=rx && px<=rx+s && py>=ry && py<=ry+s;
-  }
-
-  drag.addEventListener("pointerdown", (e)=>{
-    const p = pointerPx(e);
-    const { rx,ry } = roiRect();
-    if (inside(p.x,p.y)){
-      dragging=true;
-      offx = p.x - rx; offy = p.y - ry;
-      drag.setPointerCapture(e.pointerId);
-    }
-  });
-
-  drag.addEventListener("pointermove", (e)=>{
-    if (!dragging) return;
-    const p = pointerPx(e);
-    const w=c.width, h=c.height;
-    const s = ROI_SIZE_PX * devicePixelRatio;
-    const rx = clamp(p.x - offx, 0, w - s);
-    const ry = clamp(p.y - offy, 0, h - s);
-    center.x = (rx + s/2) / w;
-    center.y = (ry + s/2) / h;
-  });
-
-  drag.addEventListener("pointerup", ()=>dragging=false);
-  drag.addEventListener("pointercancel", ()=>dragging=false);
-
-  function roiLuminance(){
-    const { w,h,s,rx,ry } = roiRect();
-
-    // dibuja frame (espejado como el vídeo)
-    ctx.save();
-    ctx.setTransform(-1,0,0,1,w,0);
-    ctx.drawImage(v, 0, 0, w, h);
-    ctx.restore();
-
-    const x = clamp(rx, 0, w-1);
-    const y = clamp(ry, 0, h-1);
-    const ss = Math.max(1, Math.min(s, w-x, h-y));
-
-    const data = ctx.getImageData(x, y, ss, ss).data;
-
-    let sum=0;
-    const step=16;
-    for (let i=0;i<data.length;i+=step){
-      const r=data[i], g=data[i+1], b=data[i+2];
-      sum += 0.2126*r + 0.7152*g + 0.0722*b;
-    }
-    const n = Math.max(1, Math.floor(data.length/step));
-    const lum = (sum/n)/255;
-
-    drawROI();
-    return lum;
-  }
-
-  // ===== Decodificador (1/3/7 EXACTO como tu emisor) =====
-  let baseline=0, smooth=0;
-  let lastOn=false;
-  let lastSwitch=performance.now();
-  let current=""; // .-..
-  let text="";
-
-  // flags para que en un mismo silencio no meta varias veces letra/espacio
-  let letterFlushedInGap=false;
-  let spaceAddedInGap=false;
-
-  function flushLetter(){
-    if (!current) return;
-    text += (MORSE[current] ?? "�");
-    out.textContent = text;
-    current="";
-  }
-
-  function addSpace(){
-    if (!text.endsWith(" ")) {
-      text += " ";
-      out.textContent = text;
-    }
-  }
-
-  function classifyOn(ms){
-    // tu emisor usa 1u y 3u; umbral 2u es perfecto
-    return (ms < UNIT_MS * 2) ? "." : "-";
-  }
-
-  function onTransition(now, isOn){
-    const dt = now - lastSwitch;
-    lastSwitch = now;
-
-    // reset de flags al arrancar un pulso (nuevo gap termina)
-    if (isOn){
-      letterFlushedInGap = false;
-      spaceAddedInGap = false;
-    }
-
-    if (lastOn && !isOn){
-      // ON -> OFF: terminó símbolo
-      current += classifyOn(dt);
-    } else if (!lastOn && isOn){
-      // OFF -> ON: terminó gap (si era 3u ya habríamos flush en tick, pero esto también vale)
-      // no hace falta nada aquí
-    }
-
-    lastOn = isOn;
-  }
-
-  function tick(){
-    const lum = roiLuminance();
-
-    baseline += 0.02 * (lum - baseline);
-    smooth   += 0.20 * (lum - smooth);
-
-    // umbral simple + histéresis (sin UI)
-    const delta = 0.05;
-    const onTh  = baseline + delta;
-    const offTh = baseline + delta*0.6;
-
-    const isOn = lastOn ? (smooth > offTh) : (smooth > onTh);
-
-    const now = performance.now();
-
-    if (isOn !== lastOn){
-      onTransition(now, isOn);
-    } else {
-      // Si estamos en OFF y el emisor mete 3u o 7u, cerramos letra/palabra aunque no llegue otro ON (p.ej. al final)
-      if (!isOn){
-        const gap = now - lastSwitch;
-
-        if (current && !letterFlushedInGap && gap >= 3 * UNIT_MS){
-          flushLetter();
-          letterFlushedInGap = true;
-        }
-
-        if (!spaceAddedInGap && gap >= 7 * UNIT_MS){
-          // si era espacio real (o silencio final), añade un espacio una sola vez
-          addSpace();
-          spaceAddedInGap = true;
-        }
-      }
-    }
-
-    requestAnimationFrame(tick);
-  }
-
-  async function start(){
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode:"environment", width:{ideal:1280}, height:{ideal:720} },
-      audio:false
-    });
-    v.srcObject = stream;
-    await new Promise(r => v.onloadedmetadata = r);
-    v.play();
-
-    syncCanvas();
-    drawROI();
-    requestAnimationFrame(tick);
-  }
-
-  addEventListener("resize", ()=>{ syncCanvas(); drawROI(); });
-
-  start().catch(()=>{ out.textContent = "Cámara no disponible (usa https o localhost)."; });
 })();
 </script>
 </body>
