@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder</title>
+<title>Morse Decoder (frames)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -28,17 +28,8 @@
 
 <script>
 (() => {
-  // === Igual que tu emisor ===
-  const UNIT = 250;
-
-  // UI mínima
-  const ROI = 24;       // cuadrado pequeño (CSS px)
-  const PATCH = 9;      // parche pequeño y robusto
-  const DEBOUNCE = 0.45 * UNIT;
-
-  // Armado/calibración
-  const CALIB_MS = 900; // tiempo para estabilizar autoexposición/ruido
-  const MIN_ON_MS = 0.55 * UNIT; // ON real mínimo para "arrancar"
+  const ROI = 24;      // cuadrado pequeño
+  const PATCH = 9;     // parche 9x9 (robusto)
 
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
@@ -55,7 +46,7 @@
   const ctxU = ui.getContext("2d");
   const out = document.getElementById("out");
 
-  // offscreen canvas para lectura
+  // offscreen lectura
   const cv = document.createElement("canvas");
   const ctxV = cv.getContext("2d",{willReadFrequently:true});
 
@@ -66,50 +57,41 @@
   addEventListener("resize", resize);
   resize();
 
-  // ROI arrastrable (CSS px)
+  // ROI arrastrable
   let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
-
   ui.addEventListener("pointerdown",e=>{
-    if(e.clientX>=roi.x && e.clientX<=roi.x+ROI &&
-       e.clientY>=roi.y && e.clientY<=roi.y+ROI){
-      dragging=true;
-      dx=e.clientX-roi.x; dy=e.clientY-roi.y;
+    if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI &&
+       e.clientY>=roi.y&&e.clientY<=roi.y+ROI){
+      dragging=true; dx=e.clientX-roi.x; dy=e.clientY-roi.y;
       ui.setPointerCapture(e.pointerId);
     }
   });
   ui.addEventListener("pointermove",e=>{
     if(!dragging) return;
-    roi.x=e.clientX-dx;
-    roi.y=e.clientY-dy;
+    roi.x=e.clientX-dx; roi.y=e.clientY-dy;
   });
   ui.addEventListener("pointerup",()=>dragging=false);
   ui.addEventListener("pointercancel",()=>dragging=false);
 
-  // Dibuja el vídeo en cv como cover (igual que lo ves)
+  // draw cover (igual que se ve)
   function drawCover(){
     const W=cv.width,H=cv.height;
     const vw=v.videoWidth,vh=v.videoHeight;
     if(!vw||!vh) return false;
-
     const s=Math.max(W/vw,H/vh);
     const dw=vw*s, dh=vh*s;
     const ox=(W-dw)/2, oy=(H-dh)/2;
-
-    ctxV.clearRect(0,0,W,H);
     ctxV.drawImage(v, ox, oy, dw, dh);
     return true;
   }
 
-  // Luminancia media de parche PATCHxPATCH centrado en ROI
   function readLum(){
     if(!drawCover()) return null;
     const cx=Math.floor(roi.x+ROI/2);
     const cy=Math.floor(roi.y+ROI/2);
     const h=Math.floor(PATCH/2);
-
     const x=Math.max(0, Math.min(cv.width-PATCH, cx-h));
     const y=Math.max(0, Math.min(cv.height-PATCH, cy-h));
-
     const data=ctxV.getImageData(x,y,PATCH,PATCH).data;
     let sum=0;
     for(let i=0;i<data.length;i+=4){
@@ -118,39 +100,32 @@
     return sum/(data.length/4); // 0..255
   }
 
-  // ===== Decoder con armado =====
+  // ===== Decoder por frames =====
   let offLevel=null, onLevel=null;
+  let stableOn=false;
 
-  let lastStableOn=false;
-  let candidateOn=false;
-  let candidateSince=performance.now();
-  let lastTransition=performance.now();
+  // contadores de frames
+  let onFrames=0, offFrames=0;
 
-  let current="", text="";
-  let letterClosed=false, spaceAdded=false;
-
-  let startTs=performance.now();
-  let armed=false;     // NO decodificar hasta estar armado
-  let seenFirstOn=false;
-
-  function resetDecoder(){
-    current=""; text="";
-    out.textContent="";
-    lastStableOn=false;
-    candidateOn=false;
-    candidateSince=performance.now();
-    lastTransition=performance.now();
-    letterClosed=false;
-    spaceAdded=false;
-    armed=false;
-    seenFirstOn=false;
-    startTs=performance.now();
-    offLevel=null; onLevel=null;
+  // para estimar unidad (dotFrames ~ 1u)
+  const dotSamples=[]; // recogemos ON cortos
+  function pushDot(n){
+    if(n<=0) return;
+    dotSamples.push(n);
+    if(dotSamples.length>20) dotSamples.shift();
+  }
+  function dotUnit(){
+    if(dotSamples.length<4) return null;
+    const s=[...dotSamples].sort((a,b)=>a-b);
+    return s[Math.floor(s.length/2)]; // mediana
   }
 
-  function flushLetter(){
+  let current="", text="";
+  let started=false; // evita basura inicial
+
+  function flush(){
     if(!current) return;
-    text += (MORSE[current] ?? "�");
+    text += MORSE[current] ?? "�";
     out.textContent = text;
     current="";
   }
@@ -161,112 +136,76 @@
     }
   }
 
-  function tick(){
+  function classifySymbol(n, u){
+    // dot ~ 1u, dash ~ 3u
+    // umbral ~2u
+    return (n < 2.0*u) ? "." : "-";
+  }
+
+  function processFrame(){
     const lum=readLum();
     if(lum==null) return;
 
-    // Inicializa niveles
-    if(offLevel==null){
-      offLevel=lum;
-      onLevel=lum+1;
-    }
+    // niveles adaptativos
+    if(offLevel==null){ offLevel=onLevel=lum; }
 
-    const now=performance.now();
-
-    // Durante CALIB_MS solo aprendemos "OFF" (sin decodificar)
-    if(!armed){
-      // Consideramos que al principio el beacon está OFF: seguimos offLevel
-      offLevel += 0.10*(lum-offLevel);
-      // onLevel lo dejamos separado para que el umbral no sea NaN
-      onLevel = Math.max(onLevel, offLevel + 30);
-
-      if(now - startTs >= CALIB_MS){
-        armed = true;
-        // seguimos esperando primer ON real para empezar a contar tiempos
-        lastTransition = now;
-        lastStableOn = false;
-      }
-      drawROI();
-      return;
-    }
-
-    // Umbral entre niveles + histéresis
     const thr=(offLevel+onLevel)/2;
     const hyster=8;
-    const rawOn = lastStableOn ? (lum > thr - hyster) : (lum > thr + hyster);
+    const rawOn = stableOn ? (lum > thr - hyster) : (lum > thr + hyster);
 
-    // Debounce: no aceptamos cambios instantáneos
-    if(rawOn !== candidateOn){
-      candidateOn = rawOn;
-      candidateSince = now;
-    }
+    // actualizar niveles
+    const a=0.06;
+    if(rawOn) onLevel += a*(lum-onLevel);
+    else      offLevel += a*(lum-offLevel);
+    if(onLevel < offLevel + 25) onLevel = offLevel + 25;
 
-    // Si el candidato lleva estable DEBOUNCE, aceptamos cambio
-    if((now - candidateSince) >= DEBOUNCE && candidateOn !== lastStableOn){
-      const dt = now - lastTransition;
-      lastTransition = now;
-
-      // Antes de empezar a decodificar, exigimos ver un ON real
-      if(!seenFirstOn){
-        if(candidateOn === true && dt >= MIN_ON_MS){
-          seenFirstOn = true;
-          // Reset tiempos desde aquí
-          lastStableOn = true;
-          // actualiza onLevel con lo que vemos en ON
-          onLevel += 0.25*(lum-onLevel);
-        } else {
-          // seguimos sin empezar
-          lastStableOn = candidateOn;
+    // contadores por estado
+    if(rawOn){
+      onFrames++;
+      if(!stableOn){
+        // OFF -> ON (transición)
+        // aquí decidimos si hubo gap de letra/palabra usando offFrames
+        const u = dotUnit();
+        if(started && u){
+          if(offFrames >= 6.0*u){ flush(); addSpace(); }
+          else if(offFrames >= 2.2*u){ flush(); }
         }
-        drawROI();
-        return;
+        offFrames = 0;
+        stableOn = true;
       }
+    } else {
+      offFrames++;
+      if(stableOn){
+        // ON -> OFF (transición)
+        const u = dotUnit();
 
-      // Ya estamos decodificando
-      if(lastStableOn && !candidateOn){
-        // ON -> OFF: símbolo
-        current += (dt < 2*UNIT) ? "." : "-";
-        letterClosed=false; spaceAdded=false;
-        // actualiza onLevel
-        onLevel += 0.15*(lum-onLevel);
-      }
+        // Para arrancar: exige ver un ON suficientemente largo como “primer pulso”
+        // (así evitamos letra basura al inicio)
+        if(!started){
+          if(onFrames >= 2) started = true;
+        }
 
-      if(!lastStableOn && candidateOn){
-        // OFF -> ON: gap (cierra letra/palabra igual que tu emisor)
-        if(dt >= 7*UNIT){ flushLetter(); addSpace(); spaceAdded=true; }
-        else if(dt >= 3*UNIT){ flushLetter(); letterClosed=true; }
-        // actualiza offLevel (venimos de OFF)
-        offLevel += 0.15*(lum-offLevel);
-      }
+        // aprende puntos: los ON más cortos tienden a ser "."
+        // Guardamos como dot sample si parece corto (sin u aún, lo guardamos igual)
+        if(onFrames > 0 && onFrames <= 12) pushDot(onFrames);
 
-      lastStableOn = candidateOn;
-    }
+        if(started && u){
+          current += classifySymbol(onFrames, u);
+        }
 
-    // Cierre por silencio final (cuando no vuelve ON)
-    if(seenFirstOn && !lastStableOn){
-      const offTime = now - lastTransition;
-      if(offTime >= 3*UNIT && current && !letterClosed){
-        flushLetter();
-        letterClosed=true;
-      }
-      if(offTime >= 7*UNIT && !spaceAdded){
-        addSpace();
-        spaceAdded=true;
+        onFrames = 0;
+        stableOn = false;
       }
     }
 
-    // Adaptación continua de niveles
-    const a=0.04;
-    if(lastStableOn) onLevel += a*(lum-onLevel);
-    else offLevel += a*(lum-offLevel);
+    // cierre al final (OFF largo sin volver ON)
+    const u = dotUnit();
+    if(started && !stableOn && u){
+      if(current && offFrames >= 2.8*u) flush();
+      if(offFrames >= 6.5*u) addSpace();
+    }
 
-    // Mantén separación mínima
-    if(onLevel < offLevel + 20) onLevel = offLevel + 20;
-
-    drawROI();
-  }
-
-  function drawROI(){
+    // dibuja ROI
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
     ctxU.lineWidth=2;
@@ -274,28 +213,22 @@
   }
 
   function startLoop(){
-    // resetea al arrancar cámara
-    resetDecoder();
-
     if ("requestVideoFrameCallback" in HTMLVideoElement.prototype){
-      const step = () => { tick(); v.requestVideoFrameCallback(step); };
+      const step = () => { processFrame(); v.requestVideoFrameCallback(step); };
       v.requestVideoFrameCallback(step);
     } else {
-      const step = () => { tick(); requestAnimationFrame(step); };
+      const step = () => { processFrame(); requestAnimationFrame(step); };
       step();
     }
   }
 
   navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
     .then(stream=>{
-      v.srcObject = stream;
-      v.onloadedmetadata = ()=>{ v.play(); startLoop(); };
+      v.srcObject=stream;
+      v.onloadedmetadata=()=>{ v.play(); startLoop(); };
     })
     .catch(()=> out.textContent="No se pudo acceder a la cámara (usa https o localhost).");
-
 })();
 </script>
 </body>
 </html>
-
-
