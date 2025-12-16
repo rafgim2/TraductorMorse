@@ -28,190 +28,178 @@
 
 <script>
 (() => {
-  const UNIT = 250;          // como tu emisor
-  const ROI = 24;            // cuadrado pequeño (CSS px)
-  const PATCH = 7;           // parche 7x7 para brillo (robusto)
 
-  const MORSE = {
-    ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
-    "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
-    "--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
-    "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
-    "-.--":"Y","--..":"Z",
-    "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
-    ".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
-  };
+const UNIT = 250;
+const ROI = 24;
+const PATCH = 7;
+const DEBOUNCE = 0.5 * UNIT;
 
-  const v = document.getElementById("v");
-  const ui = document.getElementById("ui");
-  const ctxU = ui.getContext("2d");
-  const out = document.getElementById("out");
+const MORSE = {
+".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
+"--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
+"--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
+"...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X",
+"-.--":"Y","--..":"Z",
+"-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",
+".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
+};
 
-  // Canvas de lectura offscreen (no se ve)
-  const cv = document.createElement("canvas");
-  const ctxV = cv.getContext("2d", { willReadFrequently:true });
+const v = document.getElementById("v");
+const ui = document.getElementById("ui");
+const ctxU = ui.getContext("2d");
+const out = document.getElementById("out");
 
-  function resize(){
-    ui.width = innerWidth;
-    ui.height = innerHeight;
-    cv.width = innerWidth;
-    cv.height = innerHeight;
+// offscreen canvas
+const cv = document.createElement("canvas");
+const ctxV = cv.getContext("2d",{willReadFrequently:true});
+
+function resize(){
+  ui.width = cv.width = innerWidth;
+  ui.height = cv.height = innerHeight;
+}
+addEventListener("resize", resize);
+resize();
+
+// ROI drag
+let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
+
+ui.addEventListener("pointerdown",e=>{
+  if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI &&
+     e.clientY>=roi.y&&e.clientY<=roi.y+ROI){
+    dragging=true;
+    dx=e.clientX-roi.x;
+    dy=e.clientY-roi.y;
+    ui.setPointerCapture(e.pointerId);
   }
-  addEventListener("resize", resize);
-  resize();
+});
+ui.addEventListener("pointermove",e=>{
+  if(!dragging)return;
+  roi.x=e.clientX-dx;
+  roi.y=e.clientY-dy;
+});
+ui.addEventListener("pointerup",()=>dragging=false);
+ui.addEventListener("pointercancel",()=>dragging=false);
 
-  // ROI en CSS px
-  let roi = { x: 80, y: 80 };
-  let dragging=false, dx=0, dy=0;
+// draw video with cover
+function drawCover(){
+  const W=cv.width,H=cv.height;
+  const vw=v.videoWidth,vh=v.videoHeight;
+  if(!vw||!vh)return false;
+  const s=Math.max(W/vw,H/vh);
+  const dw=vw*s, dh=vh*s;
+  const dx=(W-dw)/2, dy=(H-dh)/2;
+  ctxV.drawImage(v,dx,dy,dw,dh);
+  return true;
+}
 
-  ui.addEventListener("pointerdown", (e)=>{
-    if (e.clientX>=roi.x && e.clientX<=roi.x+ROI &&
-        e.clientY>=roi.y && e.clientY<=roi.y+ROI){
-      dragging=true;
-      dx=e.clientX-roi.x;
-      dy=e.clientY-roi.y;
-      ui.setPointerCapture(e.pointerId);
-    }
-  });
-  ui.addEventListener("pointermove", (e)=>{
-    if(!dragging) return;
-    roi.x = e.clientX - dx;
-    roi.y = e.clientY - dy;
-  });
-  ui.addEventListener("pointerup", ()=>dragging=false);
-  ui.addEventListener("pointercancel", ()=>dragging=false);
-
-  // Dibuja el vídeo en cv reproduciendo EXACTAMENTE object-fit: cover
-  function drawVideoCover(){
-    const W = cv.width, H = cv.height;
-    const vw = v.videoWidth, vh = v.videoHeight;
-    if (!vw || !vh) return false;
-
-    // cover: escala por el max de ratios
-    const scale = Math.max(W / vw, H / vh);
-    const dw = vw * scale;
-    const dh = vh * scale;
-    const dx = (W - dw) / 2;
-    const dy = (H - dh) / 2;
-
-    ctxV.clearRect(0,0,W,H);
-    ctxV.drawImage(v, dx, dy, dw, dh);
-    return true;
+// read patch luminance
+function readLum(){
+  if(!drawCover())return null;
+  const cx=Math.floor(roi.x+ROI/2);
+  const cy=Math.floor(roi.y+ROI/2);
+  const h=Math.floor(PATCH/2);
+  const data=ctxV.getImageData(cx-h,cy-h,PATCH,PATCH).data;
+  let sum=0;
+  for(let i=0;i<data.length;i+=4){
+    sum+=0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2];
   }
+  return sum/(data.length/4);
+}
 
-  // Luminancia media de un parche PATCHxPATCH en el centro del ROI
-  function readLuminance(){
-    if (!drawVideoCover()) return null;
+// decoder
+let lastStableOn=false;
+let candidateOn=false;
+let candidateSince=performance.now();
+let lastTransition=performance.now();
+let current="", text="";
+let offLevel=null,onLevel=null;
+let letterClosed=false, spaceAdded=false;
 
-    const cx = Math.floor(roi.x + ROI/2);
-    const cy = Math.floor(roi.y + ROI/2);
-
-    const half = Math.floor(PATCH/2);
-    const x = Math.max(0, Math.min(cv.width-1, cx-half));
-    const y = Math.max(0, Math.min(cv.height-1, cy-half));
-    const w = Math.min(PATCH, cv.width - x);
-    const h = Math.min(PATCH, cv.height - y);
-
-    const data = ctxV.getImageData(x,y,w,h).data;
-    let sum = 0;
-    for(let i=0;i<data.length;i+=4){
-      const r=data[i], g=data[i+1], b=data[i+2];
-      sum += 0.2126*r + 0.7152*g + 0.0722*b;
-    }
-    return sum / (data.length/4); // 0..255 aprox
+function flushLetter(){
+  if(current){
+    text+=MORSE[current]||"�";
+    out.textContent=text;
+    current="";
   }
+}
 
-  // ===== Decoder (mismo esquema que tu emisor) =====
-  let lastOn = false;
-  let lastT = performance.now();
-  let current = "";
-  let text = "";
+function loop(){
+  const lum=readLum();
+  if(lum==null)return;
 
-  // niveles adaptativos on/off
-  let offLevel = null;
-  let onLevel  = null;
+  if(offLevel==null){ offLevel=onLevel=lum; }
 
-  function flushLetter(){
-    if (!current) return;
-    text += (MORSE[current] ?? "�");
-    out.textContent = text;
-    current = "";
-  }
-  function addSpace(){
-    if (!text.endsWith(" ")){
-      text += " ";
-      out.textContent = text;
-    }
+  const thr=(offLevel+onLevel)/2;
+  const rawOn = lum > thr;
+
+  // debounce
+  if(rawOn!==candidateOn){
+    candidateOn=rawOn;
+    candidateSince=performance.now();
   }
 
-  function classifyDotDash(dt){
-    // dot=1u, dash=3u -> umbral en 2u con tolerancia
-    return (dt < 2.0 * UNIT) ? "." : "-";
-  }
+  const now=performance.now();
+  if(now-candidateSince>=DEBOUNCE && candidateOn!==lastStableOn){
+    const dt=now-lastTransition;
+    lastTransition=now;
 
-  function processFrame(){
-    const lum = readLuminance();
-    if (lum == null) return;
-
-    // init niveles
-    if (offLevel == null) offLevel = lum;
-    if (onLevel  == null) onLevel  = lum;
-
-    // umbral entre niveles
-    const thr = (offLevel + onLevel) / 2;
-
-    // estado con histéresis suave (para que no baile)
-    const hyster = 6; // en escala 0..255 aprox
-    const isOn = lastOn ? (lum > thr - hyster) : (lum > thr + hyster);
-
-    // actualiza niveles según estado
-    const a = 0.08; // velocidad de adaptación
-    if (isOn) onLevel  = onLevel  + a * (lum - onLevel);
-    else      offLevel = offLevel + a * (lum - offLevel);
-
-    const now = performance.now();
-
-    if (isOn !== lastOn){
-      const dt = now - lastT;
-      lastT = now;
-
-      if (lastOn && !isOn){
-        // ON -> OFF: símbolo
-        current += classifyDotDash(dt);
-      }
-
-      if (!lastOn && isOn){
-        // OFF -> ON: gap (aquí cerramos, igual que tu codificador)
-        if (dt >= 7 * UNIT) { flushLetter(); addSpace(); }
-        else if (dt >= 3 * UNIT) { flushLetter(); }
-      }
-
-      lastOn = isOn;
+    if(lastStableOn && !candidateOn){
+      current += dt < 2*UNIT ? "." : "-";
+      letterClosed=false;
+      spaceAdded=false;
     }
 
-    // dibuja cuadrado
-    ctxU.clearRect(0,0,ui.width,ui.height);
-    ctxU.strokeStyle = "rgba(0,255,120,.9)";
-    ctxU.lineWidth = 2;
-    ctxU.strokeRect(roi.x, roi.y, ROI, ROI);
+    if(!lastStableOn && candidateOn){
+      if(dt>=7*UNIT){ flushLetter(); text+=" "; spaceAdded=true; }
+      else if(dt>=3*UNIT){ flushLetter(); letterClosed=true; }
+      out.textContent=text;
+    }
+
+    lastStableOn=candidateOn;
   }
 
-  function startLoop(){
-    if ("requestVideoFrameCallback" in HTMLVideoElement.prototype){
-      const step = () => { processFrame(); v.requestVideoFrameCallback(step); };
-      v.requestVideoFrameCallback(step);
-    } else {
-      const step = () => { processFrame(); requestAnimationFrame(step); };
-      step();
+  // close at end (OFF without next ON)
+  if(!lastStableOn){
+    const offTime=now-lastTransition;
+    if(offTime>=3*UNIT && current && !letterClosed){
+      flushLetter();
+      letterClosed=true;
+    }
+    if(offTime>=7*UNIT && !spaceAdded){
+      text+=" ";
+      out.textContent=text;
+      spaceAdded=true;
     }
   }
 
-  navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
-    .then(stream=>{
-      v.srcObject = stream;
-      v.onloadedmetadata = ()=>{ v.play(); startLoop(); };
-    })
-    .catch(()=> out.textContent = "No se pudo acceder a la cámara (usa https o localhost).");
+  // adapt levels
+  const a=0.05;
+  if(lastStableOn) onLevel+=a*(lum-onLevel);
+  else offLevel+=a*(lum-offLevel);
+
+  // draw ROI
+  ctxU.clearRect(0,0,ui.width,ui.height);
+  ctxU.strokeStyle="rgba(0,255,120,.9)";
+  ctxU.lineWidth=2;
+  ctxU.strokeRect(roi.x,roi.y,ROI,ROI);
+}
+
+function start(){
+  if("requestVideoFrameCallback"in HTMLVideoElement.prototype){
+    const step=()=>{loop();v.requestVideoFrameCallback(step);};
+    v.requestVideoFrameCallback(step);
+  }else{
+    const step=()=>{loop();requestAnimationFrame(step);};
+    step();
+  }
+}
+
+navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
+.then(s=>{
+  v.srcObject=s;
+  v.onloadedmetadata=()=>{v.play();start();};
+})
+.catch(()=>out.textContent="No se pudo acceder a la cámara");
 
 })();
 </script>
