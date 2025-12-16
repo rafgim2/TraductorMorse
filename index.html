@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (ready + session)</title>
+<title>Morse Decoder (más fácil)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -28,8 +28,13 @@
 
 <script>
 (() => {
-  const ROI = 24;     // cuadrado pequeño
-  const PATCH = 9;    // parche robusto
+  /* ===== UI mínima ===== */
+  const ROI_DRAW = 24;     // cuadrado que ves
+  const ROI_READ = 64;     // cuadrado REAL que se analiza (más fácil)
+  const SAMPLE_STEP = 4;   // submuestreo (rendimiento)
+
+  /* Score = mean + K * contrast */
+  const K_CONTRAST = 0.85; // sube si aún le cuesta, baja si parpadea
 
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
@@ -46,7 +51,6 @@
   const ctxU = ui.getContext("2d");
   const out = document.getElementById("out");
 
-  // offscreen lectura
   const cv = document.createElement("canvas");
   const ctxV = cv.getContext("2d", { willReadFrequently:true });
 
@@ -57,12 +61,13 @@
   addEventListener("resize", resize);
   resize();
 
-  // ROI arrastrable
+  /* ROI arrastrable (se dibuja pequeño pero analiza grande) */
   let roi = { x: 80, y: 80 };
   let dragging=false, dx=0, dy=0;
+
   ui.addEventListener("pointerdown", e=>{
-    if(e.clientX>=roi.x && e.clientX<=roi.x+ROI &&
-       e.clientY>=roi.y && e.clientY<=roi.y+ROI){
+    if(e.clientX>=roi.x && e.clientX<=roi.x+ROI_DRAW &&
+       e.clientY>=roi.y && e.clientY<=roi.y+ROI_DRAW){
       dragging=true; dx=e.clientX-roi.x; dy=e.clientY-roi.y;
       ui.setPointerCapture(e.pointerId);
     }
@@ -75,7 +80,6 @@
   ui.addEventListener("pointerup", ()=>dragging=false);
   ui.addEventListener("pointercancel", ()=>dragging=false);
 
-  // draw cover (igual que lo ves)
   function drawCover(){
     const W=cv.width, H=cv.height;
     const vw=v.videoWidth, vh=v.videoHeight;
@@ -87,96 +91,94 @@
     return true;
   }
 
-  // luminancia parche
-  function readLum(){
+  // Devuelve {mean, p10, p90} de luminancia en el ROI_READ
+  function readStats(){
     if(!drawCover()) return null;
-    const cx = Math.floor(roi.x + ROI/2);
-    const cy = Math.floor(roi.y + ROI/2);
-    const h = Math.floor(PATCH/2);
-    const x = Math.max(0, Math.min(cv.width-PATCH, cx-h));
-    const y = Math.max(0, Math.min(cv.height-PATCH, cy-h));
-    const data = ctxV.getImageData(x,y,PATCH,PATCH).data;
-    let sum=0;
-    for(let i=0;i<data.length;i+=4){
-      sum += 0.2126*data[i] + 0.7152*data[i+1] + 0.0722*data[i+2];
+
+    const cx = Math.floor(roi.x + ROI_DRAW/2);
+    const cy = Math.floor(roi.y + ROI_DRAW/2);
+
+    const half = Math.floor(ROI_READ/2);
+    const x = Math.max(0, Math.min(cv.width-ROI_READ, cx-half));
+    const y = Math.max(0, Math.min(cv.height-ROI_READ, cy-half));
+
+    const img = ctxV.getImageData(x,y,ROI_READ,ROI_READ).data;
+
+    // muestreo + histograma aproximado
+    const bins = new Uint32Array(64); // 0..255 -> 64 bins
+    let sum=0, count=0;
+
+    for(let yy=0; yy<ROI_READ; yy+=SAMPLE_STEP){
+      for(let xx=0; xx<ROI_READ; xx+=SAMPLE_STEP){
+        const i = (yy*ROI_READ + xx)*4;
+        const r=img[i], g=img[i+1], b=img[i+2];
+        const lum = (0.2126*r + 0.7152*g + 0.0722*b) | 0;
+        sum += lum;
+        bins[lum>>2]++; // /4
+        count++;
+      }
     }
-    return sum/(data.length/4);
+
+    const mean = sum / Math.max(1,count);
+
+    // percentiles sobre histograma
+    let acc=0;
+    const p10Target = count * 0.10;
+    const p90Target = count * 0.90;
+    let p10=0, p90=255;
+
+    for(let bi=0; bi<bins.length; bi++){
+      acc += bins[bi];
+      if(acc >= p10Target){ p10 = bi<<2; break; }
+    }
+    acc=0;
+    for(let bi=0; bi<bins.length; bi++){
+      acc += bins[bi];
+      if(acc >= p90Target){ p90 = bi<<2; break; }
+    }
+
+    return { mean, p10, p90 };
   }
 
-  // ===== Decoder por frames =====
+  /* ===== Decoder por frames + sesión ===== */
   let offLevel=null, onLevel=null;
   let stableOn=false;
   let onF=0, offF=0;
   let current="", text="";
   let letterClosed=false;
 
-  // aprender punto u (frames)
   const dots=[];
-  function pushDot(n){
-    dots.push(n);
-    if(dots.length>30) dots.shift();
-  }
+  function pushDot(n){ dots.push(n); if(dots.length>30) dots.shift(); }
   function dotUnit(){
     if(dots.length < 8) return null;
     const s=[...dots].sort((a,b)=>a-b);
     return s[Math.floor(s.length/2)];
   }
 
-  // ready = u estable
-  let ready=false;
-  let lastU=null;
-  let stableUCount=0;
+  let ready=false, lastU=null, stableUCount=0;
+  let pendingWordGap=false, armed=false;
 
-  // sesión
-  let pendingWordGap=false; // he visto separador aunque aún no esté ready
-  let armed=false;          // ya pasé separador y puedo mostrar mensaje real
-
-  function resetSession(keepLearning=true){
+  function resetSession(){
     current=""; letterClosed=false;
-    pendingWordGap=false;
-    armed=false;
-
-    // vaciamos salida visible
-    text="";
-    out.textContent="";
-
-    // si quieres resetear aprendizaje también (yo lo dejo aprendiendo, mejor)
-    if(!keepLearning){
-      dots.length=0;
-      ready=false; lastU=null; stableUCount=0;
-      offLevel=null; onLevel=null;
-    }
+    pendingWordGap=false; armed=false;
+    text=""; out.textContent="";
   }
 
   function updateReady(u){
     if(!u){ stableUCount=0; lastU=null; ready=false; return; }
-
-    if(lastU !== null && Math.abs(u - lastU) <= 1) stableUCount++;
-    else stableUCount = 0;
-
-    lastU = u;
-
-    // cuando u está estable un rato, ya es fiable
-    if(stableUCount >= 8) ready = true;
-
-    // Si ya vimos un separador antes de estar ready, armamos ahora
+    if(lastU!==null && Math.abs(u-lastU)<=1) stableUCount++; else stableUCount=0;
+    lastU=u;
+    if(stableUCount>=8) ready=true;
     if(ready && pendingWordGap && !armed){
-      armed = true;
-      // limpiamos por si hubiese quedado algo
+      armed=true;
       text=""; out.textContent="";
       current="";
     }
   }
 
-  function flush(u){
+  function flush(){
     if(!current) return;
-
-    if(!ready || !armed){
-      // preámbulo/ruido: no mostrar
-      current="";
-      return;
-    }
-
+    if(!ready || !armed){ current=""; return; }
     text += (MORSE[current] ?? "�");
     out.textContent = text;
     current="";
@@ -184,120 +186,94 @@
 
   function addSpace(){
     if(!ready) return;
-
     if(!armed){
-      // Este es el separador entre preámbulo y mensaje real:
-      armed = true;
-      pendingWordGap = false;
+      armed=true;
+      pendingWordGap=false;
       text=""; out.textContent="";
       current="";
       return;
     }
-
     if(text && !text.endsWith(" ")){
-      text += " ";
-      out.textContent = text;
+      text+=" ";
+      out.textContent=text;
     }
   }
 
   function processFrame(){
-    const lum = readLum();
-    if(lum == null) return;
+    const st = readStats();
+    if(!st) return;
 
-    // init niveles
-    if(offLevel==null){ offLevel=onLevel=lum; }
+    // score robusto: media + contraste
+    const contrast = Math.max(0, st.p90 - st.p10);
+    const score = st.mean + K_CONTRAST * contrast;
+
+    // niveles adaptativos sobre score
+    if(offLevel==null){ offLevel=onLevel=score; }
 
     const thr=(offLevel+onLevel)/2;
-    const hyster=8;
-    const rawOn = stableOn ? (lum > thr - hyster) : (lum > thr + hyster);
+    const hyster=10;
+    const rawOn = stableOn ? (score > thr - hyster) : (score > thr + hyster);
 
-    // adaptar niveles
-    const a=0.06;
-    if(rawOn) onLevel += a*(lum-onLevel);
-    else      offLevel += a*(lum-offLevel);
-    if(onLevel < offLevel + 25) onLevel = offLevel + 25;
+    const a=0.08;
+    if(rawOn) onLevel += a*(score-onLevel);
+    else      offLevel += a*(score-offLevel);
+    if(onLevel < offLevel + 18) onLevel = offLevel + 18;
 
-    // contadores
     if(rawOn){
       onF++;
       if(!stableOn){
-        // OFF -> ON
-        const u = dotUnit();
+        const u=dotUnit();
         updateReady(u);
 
-        // Si NO estamos ready, aún podemos detectar separador por frames “a pelo”
-        // (pantalla/cámara: vale más robustez que exactitud)
         if(!ready && offF >= 30) pendingWordGap = true;
 
         if(u){
-          if(offF >= 6*u){
-            flush(u);
-            addSpace();
-            letterClosed = true;
-          } else if(offF >= 1.3*u){
-            flush(u);
-            letterClosed = true;
-          }
+          if(offF >= 6*u){ flush(); addSpace(); letterClosed=true; }
+          else if(offF >= 1.3*u){ flush(); letterClosed=true; }
         }
-
-        offF = 0;
-        stableOn = true;
+        offF=0; stableOn=true;
       }
     } else {
       offF++;
       if(stableOn){
-        // ON -> OFF
-        if(onF > 0 && onF <= 12) pushDot(onF);
-
-        const u = dotUnit();
+        if(onF>0 && onF<=16) pushDot(onF); // más permisivo
+        const u=dotUnit();
         updateReady(u);
-
         if(u){
           current += (onF < 2*u ? "." : "-");
-          letterClosed = false;
+          letterClosed=false;
         }
-
-        onF = 0;
-        stableOn = false;
+        onF=0; stableOn=false;
       }
     }
 
-    // cierre por silencio (fin de letra / palabra)
-    const u = dotUnit();
+    const u=dotUnit();
     updateReady(u);
 
     if(!stableOn){
-      // Si estamos en OFF muy largo, esto es fin de sesión: resetea para la próxima emisión
-      // (para que no se arrastre "armed" y no salgan E del preámbulo en la siguiente)
       if((u && offF >= 12*u) || (!u && offF >= 140)){
-        resetSession(true);
+        resetSession();
       }
-
       if(u){
-        if(current && offF >= 1.8*u && !letterClosed){
-          flush(u);
-          letterClosed = true;
-        }
+        if(current && offF >= 1.8*u && !letterClosed){ flush(); letterClosed=true; }
         if(offF >= 6*u){
-          // separador palabra
-          if(!ready) pendingWordGap = true;
+          if(!ready) pendingWordGap=true;
           addSpace();
         }
       } else {
-        // Si aún no hay u, un OFF grande lo tomamos como “posible separador”
-        if(offF >= 30) pendingWordGap = true;
+        if(offF >= 30) pendingWordGap=true;
       }
     }
 
-    // dibuja ROI
+    // dibuja ROI pequeño
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
     ctxU.lineWidth=2;
-    ctxU.strokeRect(roi.x, roi.y, ROI, ROI);
+    ctxU.strokeRect(roi.x, roi.y, ROI_DRAW, ROI_DRAW);
   }
 
   function startLoop(){
-    resetSession(true);
+    resetSession();
     if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
       const step=()=>{ processFrame(); v.requestVideoFrameCallback(step); };
       v.requestVideoFrameCallback(step);
