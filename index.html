@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (LOCK)</title>
+<title>Morse Decoder (start on first space)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -28,26 +28,18 @@
 
 <script>
 (() => {
-  /* ===== UI mínima ===== */
-  const ROI_DRAW = 24;     // cuadrado visible
-  const ROI_READ = 72;     // zona REAL analizada (más fácil)
-  const SAMPLE_STEP = 4;   // rendimiento
-  const K_CONTRAST = 0.85; // score = mean + K*contrast
+  // ===== Ajustes “para que enganche fácil” =====
+  const ROI_DRAW = 24;   // cuadrado visible
+  const ROI_READ = 64;   // zona real que analizamos (más fácil)
+  const SAMPLE_STEP = 4;
+  const K_CONTRAST = 0.85;
 
-  /* ===== LOCK (clave) =====
-     Detecta el preámbulo como "tren de puntos":
-     - varios ON cortos repetidos
-     - con duración consistente (en frames)
-  */
-  const LOCK_MIN_DOTS = 7;       // cuántos puntos cortos necesito para lock
-  const LOCK_MAX_DOT_FRAMES = 18; // un punto no debería ser más largo que esto (30-60fps)
-  const LOCK_TOL_FRAMES = 2;     // tolerancia de consistencia del punto en frames
+  // Detectar que empezó señal (primer ON real)
+  const START_DELTA = 18;      // score por encima del baseline
+  const START_ON_FRAMES = 6;   // frames seguidos ON para “hay señal”
 
-  /* ===== Parser Morse (frames) ===== */
-  // Clasificación basada en u (frames)
-  const DOT_DASH_TH = 2.0;       // ON < 2u => dot, si no dash
-  const LETTER_GAP_TH = 1.3;     // OFF >= 1.3u => cierra letra
-  const WORD_GAP_TH = 6.0;       // OFF >= 6u => palabra
+  // Detectar el “primer espacio” (gap de palabra) aunque u aún no exista
+  const MIN_WORD_GAP_FRAMES = 45; // seguro para 30–60fps (ajústalo si quieres)
 
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
@@ -90,7 +82,6 @@
   ui.addEventListener("pointerup",()=>dragging=false);
   ui.addEventListener("pointercancel",()=>dragging=false);
 
-  // draw cover como el video
   function drawCover(){
     const W=cv.width,H=cv.height;
     const vw=v.videoWidth,vh=v.videoHeight;
@@ -102,10 +93,9 @@
     return true;
   }
 
-  // score robusto en ROI_READ: mean + K*(p90-p10)
+  // score = mean + K*contrast (robusto)
   function readScore(){
     if(!drawCover()) return null;
-
     const cx=Math.floor(roi.x+ROI_DRAW/2);
     const cy=Math.floor(roi.y+ROI_DRAW/2);
     const half=Math.floor(ROI_READ/2);
@@ -114,197 +104,143 @@
     const y=Math.max(0, Math.min(cv.height-ROI_READ, cy-half));
 
     const img=ctxV.getImageData(x,y,ROI_READ,ROI_READ).data;
-
     const bins=new Uint32Array(64);
-    let sum=0, count=0;
 
+    let sum=0, count=0;
     for(let yy=0; yy<ROI_READ; yy+=SAMPLE_STEP){
       for(let xx=0; xx<ROI_READ; xx+=SAMPLE_STEP){
         const i=(yy*ROI_READ+xx)*4;
         const r=img[i], g=img[i+1], b=img[i+2];
-        const lum=(0.2126*r + 0.7152*g + 0.0722*b) | 0;
-        sum += lum;
-        bins[lum>>2]++; // /4
+        const lum=(0.2126*r+0.7152*g+0.0722*b)|0;
+        sum+=lum;
+        bins[lum>>2]++;
         count++;
       }
     }
-
-    const mean = sum / Math.max(1,count);
+    const mean=sum/Math.max(1,count);
 
     let acc=0;
     const p10T=count*0.10, p90T=count*0.90;
-    let p10=0, p90=255;
-
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){ p10=bi<<2; break; } }
+    let p10=0,p90=255;
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p10T){p10=bi<<2; break;} }
     acc=0;
-    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){ p90=bi<<2; break; } }
+    for(let bi=0; bi<bins.length; bi++){ acc+=bins[bi]; if(acc>=p90T){p90=bi<<2; break;} }
 
-    const contrast = Math.max(0, p90-p10);
+    const contrast=Math.max(0,p90-p10);
     return mean + K_CONTRAST*contrast;
   }
 
-  // =========================
-  // LOCK + Decoder state
-  // =========================
+  // ===== Decoder (frames) + estados =====
+  // estados:
+  // 0 WAIT_FIRST_ON: solo baseline (si esperas, no pasa nada)
+  // 1 SEEK_SEPARATOR: hay señal; esperamos el primer gap largo (espacio tras preámbulo)
+  // 2 DECODE: mostramos mensaje real
+  let STATE = 0;
 
-  // Detector ON/OFF con umbral adaptativo simple (pero SOLO para segmentar)
-  let offLevel=null, onLevel=null;
-  let stableOn=false;
-  let onF=0, offF=0;
+  let baseline=null, startOnCount=0;
 
-  // Segmentos recientes para LOCK: guardamos duraciones ON
-  const recentDots = []; // duraciones ON cortas (frames)
+  let offLevel=null,onLevel=null, stableOn=false;
+  let onF=0, offF=0, current="", text="", letterClosed=false;
 
-  // LOCK state
-  let locked=false;
-  let u=null;
-
-  // Mostrar solo tras separador (word gap) después del lock
-  let armed=false;
-  let current="";
-  let text="";
-  let letterClosed=false;
-
-  function resetForNewMessage(){
-    armed=false;
-    current="";
-    text="";
-    out.textContent="";
-    letterClosed=false;
-  }
-
-  function pushRecentDot(n){
-    recentDots.push(n);
-    if(recentDots.length > 20) recentDots.shift();
-  }
-
-  function median(arr){
-    const s=[...arr].sort((a,b)=>a-b);
+  const dots=[];
+  function pushDot(n){ dots.push(n); if(dots.length>30) dots.shift(); }
+  function dotUnit(){
+    if(dots.length<8) return null;
+    const s=[...dots].sort((a,b)=>a-b);
     return s[Math.floor(s.length/2)];
   }
 
-  function tryLock(){
-    // Necesitamos suficientes ON cortos
-    if(recentDots.length < LOCK_MIN_DOTS) return false;
+  function resetAllForNewSignal(score){
+    // reseteo completo cuando detecto el primer ON real
+    dots.length=0;
+    offLevel = score;
+    onLevel  = score + 25;
+    stableOn = false;
+    onF=0; offF=0;
+    current=""; letterClosed=false;
 
-    // Tomamos los últimos LOCK_MIN_DOTS
-    const last = recentDots.slice(-LOCK_MIN_DOTS);
-
-    // Deben ser "cortos"
-    if(last.some(x => x > LOCK_MAX_DOT_FRAMES)) return false;
-
-    // Consistencia: mediana y desviación máxima
-    const m = median(last);
-    const maxDev = Math.max(...last.map(x => Math.abs(x - m)));
-
-    if(maxDev <= LOCK_TOL_FRAMES){
-      u = m;            // 1u (frames) = duración del punto (mediana)
-      locked = true;
-      resetForNewMessage(); // empezamos limpios
-      return true;
-    }
-    return false;
+    text=""; out.textContent="";
   }
 
-  function classifySymbol(onFrames){
-    return (onFrames < DOT_DASH_TH * u) ? "." : "-";
-  }
-
-  function flushLetter(){
+  function flush(u){
     if(!current) return;
-    if(!armed){ current=""; return; } // no mostrar preámbulo
+    if(STATE !== 2){ current=""; return; } // solo mostramos en DECODE
     text += (MORSE[current] ?? "�");
-    out.textContent = text;
+    out.textContent=text;
     current="";
   }
 
   function addSpace(){
-    if(!armed){
-      // Este word-gap es el separador preámbulo -> mensaje
-      armed = true;
-      text=""; out.textContent="";
-      current="";
-      return;
-    }
+    if(STATE !== 2) return;
     if(text && !text.endsWith(" ")){
       text += " ";
-      out.textContent = text;
+      out.textContent=text;
     }
   }
 
-  // Detecta fin de sesión para permitir repetir sin “arrastre”
-  function maybeEndSession(){
-    if(!locked || !u) return;
-    // silencio muy largo => fin emisión
-    if(offF >= 12 * u){
-      // no borramos el lock, pero rearmamos para próxima emisión
-      locked = false;
-      u = null;
-      recentDots.length = 0;
-      resetForNewMessage();
-      // reinicia niveles para segmentar limpio
-      offLevel=null; onLevel=null;
-      stableOn=false; onF=0; offF=0;
-    }
-  }
-
-  function processFrame(score){
-    // umbral adaptativo SOLO para segmentar ON/OFF
-    if(offLevel==null){
-      offLevel = onLevel = score;
-    }
+  function processDecoder(score){
+    if(offLevel==null){ offLevel=onLevel=score; }
 
     const thr=(offLevel+onLevel)/2;
     const hyster=10;
-    const rawOn = stableOn ? (score > thr - hyster) : (score > thr + hyster);
+    const rawOn = stableOn ? (score>thr-hyster) : (score>thr+hyster);
 
     const a=0.08;
-    if(rawOn) onLevel += a*(score - onLevel);
-    else      offLevel += a*(score - offLevel);
+    if(rawOn) onLevel += a*(score-onLevel);
+    else      offLevel += a*(score-offLevel);
     if(onLevel < offLevel + 18) onLevel = offLevel + 18;
 
     if(rawOn){
       onF++;
       if(!stableOn){
-        // OFF -> ON: aquí cerramos gaps si estamos locked
-        if(locked && u){
-          if(offF >= WORD_GAP_TH * u){ flushLetter(); addSpace(); letterClosed=true; }
-          else if(offF >= LETTER_GAP_TH * u){ flushLetter(); letterClosed=true; }
+        // OFF -> ON
+        const u = dotUnit();
+
+        // ---- aquí detectamos el PRIMER ESPACIO (separador) ----
+        // Si estamos en SEEK_SEPARATOR y hemos tenido un OFF largo, ARMAMOS el mensaje
+        const isWordGap = (u && offF >= 6*u) || (!u && offF >= MIN_WORD_GAP_FRAMES);
+        if(STATE === 1 && isWordGap){
+          // Este es el espacio preámbulo→mensaje real
+          STATE = 2;
+          text=""; out.textContent="";
+          current="";
         }
+
+        // gaps normales (solo decodifica si ya estamos en DECODE)
+        if(u){
+          if(offF >= 6*u){ flush(u); addSpace(); letterClosed=true; }
+          else if(offF >= 1.3*u){ flush(u); letterClosed=true; }
+        }
+
         offF=0;
         stableOn=true;
       }
     } else {
       offF++;
       if(stableOn){
-        // ON -> OFF: aquí clasificamos símbolo si locked
-        if(onF > 0){
-          // Alimenta el LOCK con puntos potenciales (ON cortos)
-          if(!locked && onF <= LOCK_MAX_DOT_FRAMES){
-            pushRecentDot(onF);
-            tryLock();
-          }
-
-          if(locked && u){
-            current += classifySymbol(onF);
-            letterClosed=false;
-          }
+        // ON -> OFF: símbolo
+        if(onF>0 && onF<=16) pushDot(onF);
+        const u=dotUnit();
+        if(u){
+          current += (onF < 2*u ? "." : "-");
+          letterClosed=false;
         }
         onF=0;
         stableOn=false;
       }
     }
 
-    // cierre por silencio (sin ON siguiente)
-    if(locked && u && !stableOn){
-      if(current && offF >= 1.8 * u && !letterClosed){
-        flushLetter();
-        letterClosed=true;
+    // cierre por silencio
+    const u=dotUnit();
+    if(!stableOn){
+      if(u){
+        if(current && offF >= 1.8*u && !letterClosed){ flush(u); letterClosed=true; }
+        if(offF >= 6*u){
+          // si aún estamos buscando separador, esto también cuenta como “posible”
+          // pero el paso a DECODE lo hacemos en el siguiente OFF->ON (arriba)
+          if(STATE === 2) addSpace();
+        }
       }
-      if(offF >= WORD_GAP_TH * u){
-        addSpace();
-      }
-      maybeEndSession();
     }
   }
 
@@ -316,17 +252,37 @@
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
     ctxU.lineWidth=2;
-    ctxU.strokeRect(roi.x, roi.y, ROI_DRAW, ROI_DRAW);
+    ctxU.strokeRect(roi.x,roi.y,ROI_DRAW,ROI_DRAW);
 
-    processFrame(score);
+    if(STATE === 0){
+      // baseline OFF mientras no haya señal
+      if(baseline==null) baseline=score;
+      baseline = baseline + 0.05*(score-baseline);
+
+      if(score > baseline + START_DELTA) startOnCount++;
+      else startOnCount = 0;
+
+      if(startOnCount >= START_ON_FRAMES){
+        // primer ON real detectado -> reseteo y paso a buscar separador
+        resetAllForNewSignal(score);
+        STATE = 1; // SEEK_SEPARATOR
+      }
+      return;
+    }
+
+    processDecoder(score);
   }
 
   function startLoop(){
-    // estado inicial
-    locked=false; u=null; recentDots.length=0;
+    STATE = 0;
+    baseline = null;
+    startOnCount = 0;
     offLevel=null; onLevel=null;
-    stableOn=false; onF=0; offF=0;
-    resetForNewMessage();
+    stableOn=false;
+    onF=0; offF=0;
+    current=""; text=""; out.textContent="";
+    letterClosed=false;
+    dots.length=0;
 
     if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
       const step=()=>{ loop(); v.requestVideoFrameCallback(step); };
@@ -337,13 +293,15 @@
     }
   }
 
-  navigator.mediaDevices.getUserMedia({ video:{ facingMode:"environment" }, audio:false })
+  navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
     .then(stream=>{
-      v.srcObject = stream;
-      v.onloadedmetadata = ()=>{ v.play(); startLoop(); };
+      v.srcObject=stream;
+      v.onloadedmetadata=()=>{ v.play(); startLoop(); };
     })
     .catch(()=> out.textContent="No se pudo acceder a la cámara (usa https o localhost).");
 })();
 </script>
 </body>
 </html>
+
+
