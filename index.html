@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Morse Decoder (final definitivo)</title>
+<title>Morse Decoder (ready)</title>
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
@@ -28,12 +28,11 @@
 
 <script>
 (() => {
+  /* ===== Visual ===== */
+  const ROI = 24;     // cuadrado pequeño
+  const PATCH = 9;    // parche para luminancia (robusto)
 
-  /* ===== CONFIG ===== */
-  const ROI = 24;
-  const PATCH = 9;
-  const IGNORE_LETTERS = 3; // ← preámbulo EEE
-
+  /* ===== Morse ===== */
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
     "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
@@ -49,8 +48,9 @@
   const ctxU = ui.getContext("2d");
   const out = document.getElementById("out");
 
+  /* Offscreen lectura */
   const cv = document.createElement("canvas");
-  const ctxV = cv.getContext("2d",{willReadFrequently:true});
+  const ctxV = cv.getContext("2d", { willReadFrequently:true });
 
   function resize(){
     ui.width = cv.width = innerWidth;
@@ -59,113 +59,229 @@
   addEventListener("resize", resize);
   resize();
 
-  /* ===== ROI arrastrable ===== */
-  let roi={x:80,y:80}, dragging=false, dx=0, dy=0;
-  ui.addEventListener("pointerdown",e=>{
-    if(e.clientX>=roi.x&&e.clientX<=roi.x+ROI &&
-       e.clientY>=roi.y&&e.clientY<=roi.y+ROI){
-      dragging=true; dx=e.clientX-roi.x; dy=e.clientY-roi.y;
+  /* ROI arrastrable */
+  let roi = { x: 80, y: 80 };
+  let dragging=false, dx=0, dy=0;
+
+  ui.addEventListener("pointerdown", e=>{
+    if(e.clientX>=roi.x && e.clientX<=roi.x+ROI &&
+       e.clientY>=roi.y && e.clientY<=roi.y+ROI){
+      dragging=true;
+      dx=e.clientX-roi.x; dy=e.clientY-roi.y;
       ui.setPointerCapture(e.pointerId);
     }
   });
-  ui.addEventListener("pointermove",e=>{
-    if(dragging){ roi.x=e.clientX-dx; roi.y=e.clientY-dy; }
+  ui.addEventListener("pointermove", e=>{
+    if(!dragging) return;
+    roi.x=e.clientX-dx;
+    roi.y=e.clientY-dy;
   });
-  ui.addEventListener("pointerup",()=>dragging=false);
-  ui.addEventListener("pointercancel",()=>dragging=false);
+  ui.addEventListener("pointerup", ()=>dragging=false);
+  ui.addEventListener("pointercancel", ()=>dragging=false);
 
+  /* draw video como cover (igual que se ve) */
   function drawCover(){
-    const W=cv.width,H=cv.height;
-    const vw=v.videoWidth,vh=v.videoHeight;
-    if(!vw||!vh) return false;
-    const s=Math.max(W/vw,H/vh);
-    ctxV.drawImage(v,(W-vw*s)/2,(H-vh*s)/2,vw*s,vh*s);
+    const W=cv.width, H=cv.height;
+    const vw=v.videoWidth, vh=v.videoHeight;
+    if(!vw || !vh) return false;
+    const s = Math.max(W/vw, H/vh);
+    const dw = vw*s, dh = vh*s;
+    const ox = (W-dw)/2, oy = (H-dh)/2;
+    ctxV.drawImage(v, ox, oy, dw, dh);
     return true;
   }
 
+  /* luminancia media de parche */
   function readLum(){
     if(!drawCover()) return null;
-    const cx=roi.x+ROI/2, cy=roi.y+ROI/2, h=PATCH>>1;
-    const data=ctxV.getImageData(cx-h,cy-h,PATCH,PATCH).data;
+    const cx = Math.floor(roi.x + ROI/2);
+    const cy = Math.floor(roi.y + ROI/2);
+    const h = Math.floor(PATCH/2);
+    const x = Math.max(0, Math.min(cv.width-PATCH, cx-h));
+    const y = Math.max(0, Math.min(cv.height-PATCH, cy-h));
+    const data = ctxV.getImageData(x,y,PATCH,PATCH).data;
+
     let sum=0;
-    for(let i=0;i<data.length;i+=4)
-      sum+=0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2];
-    return sum/(data.length/4);
+    for(let i=0;i<data.length;i+=4){
+      sum += 0.2126*data[i] + 0.7152*data[i+1] + 0.0722*data[i+2];
+    }
+    return sum/(data.length/4); // 0..255 aprox
   }
 
-  /* ===== DECODER POR FRAMES ===== */
-  let offLevel=null,onLevel=null,stableOn=false;
-  let onF=0,offF=0,current="",text="";
-  let started=false,letterClosed=false;
-  let decodedCount=0;
+  /* ===== Decoder por frames + ready ===== */
+  let offLevel=null, onLevel=null;
+  let stableOn=false;
+  let onF=0, offF=0;
+  let current="", text="";
+  let letterClosed=false;
 
+  // aprendizaje del punto (u)
   const dots=[];
-  const dotUnit=()=>dots.length>=5?[...dots].sort((a,b)=>a-b)[dots.length>>1]:null;
+  function pushDot(n){
+    dots.push(n);
+    if(dots.length>30) dots.shift();
+  }
+  function dotUnit(){
+    if(dots.length < 8) return null; // pedimos más muestras para que sea sólido desde el inicio
+    const s=[...dots].sort((a,b)=>a-b);
+    return s[Math.floor(s.length/2)];
+  }
 
-  function flush(){
+  // estado "listo"
+  let ready=false;
+  let lastU=null;
+  let stableUCount=0;
+  let seenWordGapAfterReady=false;
+
+  function updateReady(u){
+    if(!u) { stableUCount=0; lastU=null; return; }
+
+    if(lastU !== null && Math.abs(u - lastU) <= 1) stableUCount++;
+    else stableUCount = 0;
+
+    lastU = u;
+
+    // cuando u está estable varios ciclos, podemos considerarnos listos
+    if(stableUCount >= 8) ready = true;
+  }
+
+  function resetOutput(){
+    text=""; out.textContent="";
+  }
+
+  function flush(u){
     if(!current) return;
-    decodedCount++;
-    if(decodedCount > IGNORE_LETTERS){
-      text+=MORSE[current]||"�";
-      out.textContent=text;
+
+    // Si no estamos listos, tiramos lo decodificado (preamble/ruido)
+    if(!ready){
+      current="";
+      return;
     }
+
+    // Hasta que no veamos un "word gap" (el espacio entre preámbulo y mensaje),
+    // seguimos sin mostrar nada. Así garantizamos empezar desde la primera letra real.
+    if(!seenWordGapAfterReady){
+      current="";
+      return;
+    }
+
+    text += (MORSE[current] ?? "�");
+    out.textContent = text;
     current="";
   }
-  function space(){
-    if(decodedCount>IGNORE_LETTERS && !text.endsWith(" ")){
-      text+=" "; out.textContent=text;
+
+  function addSpace(){
+    if(!ready) return;
+    if(!seenWordGapAfterReady) {
+      // este es el espacio que separa preámbulo y mensaje real
+      seenWordGapAfterReady = true;
+      resetOutput();       // por si hubiera algo anterior
+      return;
+    }
+    if(text && !text.endsWith(" ")){
+      text += " ";
+      out.textContent = text;
     }
   }
 
-  function loop(){
-    const lum=readLum(); if(lum==null) return;
+  function processFrame(){
+    const lum = readLum();
+    if(lum == null) return;
+
+    // init niveles
     if(offLevel==null){ offLevel=onLevel=lum; }
 
     const thr=(offLevel+onLevel)/2;
-    const on = stableOn ? lum>thr-8 : lum>thr+8;
+    const hyster=8;
+    const rawOn = stableOn ? (lum > thr - hyster) : (lum > thr + hyster);
 
-    if(on){ onF++; onLevel+=0.05*(lum-onLevel); }
-    else{ offF++; offLevel+=0.05*(lum-offLevel); }
+    // adapto niveles
+    const a=0.06;
+    if(rawOn) onLevel += a*(lum-onLevel);
+    else      offLevel += a*(lum-offLevel);
+    if(onLevel < offLevel + 25) onLevel = offLevel + 25;
 
-    if(on!==stableOn){
-      const u=dotUnit();
-      if(stableOn){
-        if(!started && onF>=2) started=true;
-        if(onF<=12) dots.push(onF);
-        if(started&&u) current+=(onF<2*u?".":"-");
-        onF=0; letterClosed=false;
-      }else if(started&&u){
-        if(offF>=6*u){ flush(); space(); letterClosed=true; }
-        else if(offF>=1.3*u){ flush(); letterClosed=true; }
-        offF=0;
+    // contadores
+    if(rawOn){
+      onF++;
+      if(!stableOn){
+        // OFF->ON: decide si gap era letra/palabra
+        const u = dotUnit();
+        updateReady(u);
+
+        if(u){
+          if(offF >= 6*u){
+            flush(u);
+            addSpace();           // marca separación preámbulo→mensaje al primer word gap
+            letterClosed = true;
+          } else if(offF >= 1.3*u){
+            flush(u);
+            letterClosed = true;
+          }
+        }
+        offF = 0;
+        stableOn = true;
       }
-      stableOn=on;
+    } else {
+      offF++;
+      if(stableOn){
+        // ON->OFF: símbolo
+        const u = dotUnit();
+        updateReady(u);
+
+        // aprender puntos con ON cortos
+        if(onF > 0 && onF <= 12) pushDot(onF);
+
+        const u2 = dotUnit();
+        updateReady(u2);
+
+        if(u2){
+          current += (onF < 2*u2 ? "." : "-");
+          letterClosed = false;
+        }
+
+        onF = 0;
+        stableOn = false;
+      }
     }
 
-    const u=dotUnit();
-    if(started&&!stableOn&&u){
-      if(current&&offF>=1.8*u&&!letterClosed){ flush(); letterClosed=true; }
-      if(offF>=6*u) space();
+    // cierre por silencio (si no vuelve ON)
+    const u = dotUnit();
+    updateReady(u);
+    if(u && !stableOn){
+      if(current && offF >= 1.8*u && !letterClosed){
+        flush(u);
+        letterClosed = true;
+      }
+      if(offF >= 6*u){
+        addSpace();
+      }
     }
 
+    // dibuja ROI
     ctxU.clearRect(0,0,ui.width,ui.height);
     ctxU.strokeStyle="rgba(0,255,120,.9)";
-    ctxU.strokeRect(roi.x,roi.y,ROI,ROI);
+    ctxU.lineWidth=2;
+    ctxU.strokeRect(roi.x, roi.y, ROI, ROI);
   }
 
-  function start(){
-    if("requestVideoFrameCallback"in HTMLVideoElement.prototype){
-      const step=()=>{loop();v.requestVideoFrameCallback(step);};
+  function startLoop(){
+    if("requestVideoFrameCallback" in HTMLVideoElement.prototype){
+      const step=()=>{ processFrame(); v.requestVideoFrameCallback(step); };
       v.requestVideoFrameCallback(step);
-    }else requestAnimationFrame(function step(){loop();requestAnimationFrame(step);});
+    } else {
+      const step=()=>{ processFrame(); requestAnimationFrame(step); };
+      step();
+    }
   }
 
-  navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
-    .then(s=>{v.srcObject=s;v.onloadedmetadata=()=>{v.play();start();};});
-
+  navigator.mediaDevices.getUserMedia({ video:{ facingMode:"environment" }, audio:false })
+    .then(stream=>{
+      v.srcObject=stream;
+      v.onloadedmetadata=()=>{ v.play(); startLoop(); };
+    })
+    .catch(()=> out.textContent="No se pudo acceder a la cámara (usa https o localhost).");
 })();
 </script>
 </body>
 </html>
-
-
