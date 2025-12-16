@@ -3,427 +3,229 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Morse Decoder (Beacon por cámara)</title>
+  <title>Morse Decoder</title>
   <style>
     :root { color-scheme: dark; }
-    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background:#050607; color:#d7ffe0; }
-    .wrap { display:grid; grid-template-columns: 1fr 360px; gap:14px; padding:14px; }
-    .stage { position:relative; border:1px solid #0d3; border-radius:14px; overflow:hidden; background:#000; }
-    video { width:100%; height:auto; display:block; transform: scaleX(-1); } /* espejo opcional */
-    canvas.overlay { position:absolute; inset:0; pointer-events:none; }
-    .panel { border:1px solid #0d3; border-radius:14px; padding:12px; background: rgba(0,40,20,.25); }
-    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:8px 0; }
-    label { font-size:14px; opacity:.9; }
-    select, button, input[type="range"] {
-      background:#06140c; color:#7CFF9D; border:1px solid #0d3; border-radius:10px; padding:8px 10px;
+    body { margin:0; background:#000; overflow:hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    video { position:fixed; inset:0; width:100vw; height:100vh; object-fit:cover; transform: scaleX(-1); }
+    canvas { position:fixed; inset:0; pointer-events:none; }
+    #out {
+      position:fixed; left:16px; right:16px; bottom:16px;
+      min-height:56px; padding:12px 14px;
+      border:1px solid rgba(0,255,120,.7);
+      border-radius:14px;
+      background: rgba(0,0,0,.55);
+      color:#7CFF9D;
+      font-size:20px;
+      line-height:1.3;
+      white-space:pre-wrap;
+      user-select:text;
     }
-    button { cursor:pointer; }
-    button:disabled { opacity:.4; cursor:not-allowed; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    textarea {
-      width:100%; height:160px; resize:vertical;
-      background:#06140c; color:#7CFF9D; border:1px solid #0d3; border-radius:12px; padding:10px;
-      outline:none;
-    }
-    .hint { font-size:12px; opacity:.75; line-height:1.35; }
-    .meter { display:flex; align-items:center; gap:10px; }
-    .bar { flex:1; height:10px; border-radius:999px; border:1px solid #0d3; background:#06140c; overflow:hidden; }
-    .bar > i { display:block; height:100%; width:0%; background:#0d3; }
-    .pill { padding:4px 8px; border:1px solid #0d3; border-radius:999px; font-size:12px; opacity:.9; }
+    /* capa invisible para arrastrar el recuadro */
+    #dragLayer { position:fixed; inset:0; background:transparent; }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="stage" id="stage">
-      <video id="video" playsinline autoplay muted></video>
-      <canvas id="overlay" class="overlay"></canvas>
-    </div>
-
-    <div class="panel">
-      <div class="row">
-        <button id="btnStart">Iniciar cámara</button>
-        <button id="btnListen" disabled>Escuchar Morse</button>
-        <button id="btnClear" disabled>Limpiar</button>
-      </div>
-
-      <div class="row">
-        <label>Unidad (ms):</label>
-        <select id="unitMs">
-          <option>120</option>
-          <option>150</option>
-          <option>200</option>
-          <option selected>250</option>
-          <option>300</option>
-          <option>400</option>
-        </select>
-        <span class="pill mono" id="state">OFF</span>
-      </div>
-
-      <div class="row meter">
-        <label class="mono">Brillo</label>
-        <div class="bar"><i id="barFill"></i></div>
-        <span class="pill mono" id="lux">0.000</span>
-      </div>
-
-      <div class="row">
-        <label>Sensibilidad:</label>
-        <input id="sens" type="range" min="0" max="100" value="55" />
-        <span class="pill mono" id="sensVal">55</span>
-      </div>
-
-      <div class="row">
-        <label class="mono">Símbolos:</label>
-        <span class="pill mono" id="symbols"> </span>
-      </div>
-
-      <div class="row">
-        <label>Texto decodificado:</label>
-      </div>
-      <textarea id="out" placeholder="Aquí irán apareciendo las letras..."></textarea>
-
-      <div class="hint">
-        <b>Uso:</b> Inicia cámara → coloca el beacon dentro del recuadro (arrástralo con el ratón/tacto) →
-        pulsa <b>Escuchar Morse</b>. Ajusta <b>Unidad</b> al mismo valor que uses al emitir.
-        <br/><br/>
-        <b>Tip:</b> Si hay ruido (parpadeos), baja o sube <b>Sensibilidad</b> hasta que el estado OFF/ON sea estable.
-      </div>
-    </div>
-  </div>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="ov"></canvas>
+  <div id="dragLayer"></div>
+  <div id="out"></div>
 
 <script>
 (() => {
-  // --- Morse map ---
+  // ===== AJUSTE ÚNICO (si quieres) =====
+  const UNIT_MS = 250; // pon aquí la misma unidad que uses al emitir (punto=1u, raya=3u)
+
+  // Morse
   const MORSE = {
     ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F","--.":"G","....":"H","..":"I",
     ".---":"J","-.-":"K",".-..":"L","--":"M","-.":"N","---":"O",".--.":"P","--.-":"Q",".-.":"R",
     "...":"S","-":"T","..-":"U","...-":"V",".--":"W","-..-":"X","-.--":"Y","--..":"Z",
-    "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",".....":"5","-....":"6","--...":"7","---..":"8","----.":"9",
-    ".-.-.-":".","--..--":",","..--..":"?","-.-.--":"!","-....-":"-",".----.":"'","-..-.":"/","-.--.":"(","-.--.-":")",
-    ".-..-.":'"',".--.-.":"@","---...":":","-.-.-.":";","..--.-":"_","...-..-":"$",".-...":"&","-...-":"=",".-.-.":"+"
+    "-----":"0",".----":"1","..---":"2","...--":"3","....-":"4",".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
   };
 
-  // --- Elements ---
   const video = document.getElementById("video");
-  const overlay = document.getElementById("overlay");
-  const ctx = overlay.getContext("2d", { willReadFrequently: true });
-
-  const btnStart = document.getElementById("btnStart");
-  const btnListen = document.getElementById("btnListen");
-  const btnClear = document.getElementById("btnClear");
-
-  const unitSel = document.getElementById("unitMs");
+  const ov = document.getElementById("ov");
+  const ctx = ov.getContext("2d", { willReadFrequently: true });
   const out = document.getElementById("out");
-  const symbolsEl = document.getElementById("symbols");
-  const stateEl = document.getElementById("state");
+  const dragLayer = document.getElementById("dragLayer");
 
-  const barFill = document.getElementById("barFill");
-  const luxEl = document.getElementById("lux");
-  const sens = document.getElementById("sens");
-  const sensVal = document.getElementById("sensVal");
+  // ROI pequeño (normalizado a pantalla)
+  let roi = { x: 0.82, y: 0.12, w: 0.12, h: 0.12 };
 
-  // --- ROI rectangle (movable) in overlay coordinates ---
-  let roi = { x: 0.72, y: 0.10, w: 0.22, h: 0.22 }; // normalized
-  let dragging = false;
-  let dragOffset = { x: 0, y: 0 };
+  function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
 
-  function clamp(v,min,max){ return Math.max(min, Math.min(max,v)); }
-
-  function overlaySizeToVideo() {
-    // match overlay to displayed video size
-    const rect = video.getBoundingClientRect();
-    overlay.width = Math.floor(rect.width * devicePixelRatio);
-    overlay.height = Math.floor(rect.height * devicePixelRatio);
+  function syncCanvas() {
+    ov.width = Math.floor(innerWidth * devicePixelRatio);
+    ov.height = Math.floor(innerHeight * devicePixelRatio);
   }
 
-  function drawOverlay() {
-    const w = overlay.width, h = overlay.height;
+  function drawROI() {
+    const w = ov.width, h = ov.height;
     ctx.clearRect(0,0,w,h);
 
-    // ROI rect
-    const rx = roi.x * w, ry = roi.y * h, rw = roi.w * w, rh = roi.h * h;
-
+    const rx = roi.x*w, ry = roi.y*h, rw = roi.w*w, rh = roi.h*h;
     ctx.lineWidth = 3 * devicePixelRatio;
     ctx.strokeStyle = "rgba(0,255,120,0.9)";
-    ctx.fillStyle = "rgba(0,255,120,0.08)";
+    ctx.fillStyle = "rgba(0,255,120,0.10)";
     ctx.beginPath();
-    ctx.roundRect(rx, ry, rw, rh, 18 * devicePixelRatio);
+    ctx.roundRect(rx, ry, rw, rh, 14 * devicePixelRatio);
     ctx.fill();
     ctx.stroke();
-
-    // crosshair
-    ctx.strokeStyle = "rgba(0,255,120,0.35)";
-    ctx.lineWidth = 1.5 * devicePixelRatio;
-    ctx.beginPath();
-    ctx.moveTo(rx + rw/2, ry);
-    ctx.lineTo(rx + rw/2, ry + rh);
-    ctx.moveTo(rx, ry + rh/2);
-    ctx.lineTo(rx + rw, ry + rh/2);
-    ctx.stroke();
   }
 
-  function getPointerPos(e) {
-    const rect = overlay.getBoundingClientRect();
-    const px = (e.clientX - rect.left) / rect.width;
-    const py = (e.clientY - rect.top) / rect.height;
-    return { x: px, y: py };
+  // Arrastrar ROI
+  let dragging=false, offx=0, offy=0;
+  function pointerNorm(e){
+    return { x: e.clientX / innerWidth, y: e.clientY / innerHeight };
   }
-
-  function isInsideROI(p) {
-    return p.x >= roi.x && p.x <= roi.x+roi.w && p.y >= roi.y && p.y <= roi.y+roi.h;
+  function inside(p){
+    return p.x>=roi.x && p.x<=roi.x+roi.w && p.y>=roi.y && p.y<=roi.y+roi.h;
   }
-
-  // allow dragging ROI (pointer events on stage, not canvas, because canvas pointer-events none)
-  const stage = document.getElementById("stage");
-  stage.addEventListener("pointerdown", (e) => {
-    if (!overlay.width) return;
-    const p = getPointerPos(e);
-    if (isInsideROI(p)) {
-      dragging = true;
-      dragOffset.x = p.x - roi.x;
-      dragOffset.y = p.y - roi.y;
-      stage.setPointerCapture(e.pointerId);
+  dragLayer.addEventListener("pointerdown", (e) => {
+    const p = pointerNorm(e);
+    if (inside(p)) {
+      dragging=true;
+      offx = p.x - roi.x;
+      offy = p.y - roi.y;
+      dragLayer.setPointerCapture(e.pointerId);
     }
   });
-  stage.addEventListener("pointermove", (e) => {
+  dragLayer.addEventListener("pointermove", (e) => {
     if (!dragging) return;
-    const p = getPointerPos(e);
-    roi.x = clamp(p.x - dragOffset.x, 0, 1 - roi.w);
-    roi.y = clamp(p.y - dragOffset.y, 0, 1 - roi.h);
+    const p = pointerNorm(e);
+    roi.x = clamp(p.x - offx, 0, 1 - roi.w);
+    roi.y = clamp(p.y - offy, 0, 1 - roi.h);
   });
-  stage.addEventListener("pointerup", () => dragging = false);
-  stage.addEventListener("pointercancel", () => dragging = false);
+  dragLayer.addEventListener("pointerup", () => dragging=false);
+  dragLayer.addEventListener("pointercancel", () => dragging=false);
 
-  // --- Morse decoding state ---
-  let listening = false;
-  let lastOn = false;
-  let lastSwitchTs = 0;
+  // Luminancia media dentro del ROI
+  function roiLuminance() {
+    const w = ov.width, h = ov.height;
 
-  let currentSymbols = ""; // ".-.-"
-  let decoded = "";
-
-  // brightness tracking
-  let baseline = 0;         // slow moving average (ambient)
-  let smooth = 0;           // faster moving average (signal)
-  let lastFrameTs = 0;
-
-  function resetDecoder() {
-    lastOn = false;
-    lastSwitchTs = performance.now();
-    currentSymbols = "";
-    symbolsEl.textContent = " ";
-    stateEl.textContent = "OFF";
-  }
-
-  function flushLetter() {
-    if (!currentSymbols) return;
-    const ch = MORSE[currentSymbols] ?? "�";
-    decoded += ch;
-    out.value = decoded;
-    currentSymbols = "";
-    symbolsEl.textContent = " ";
-  }
-
-  function pushSpace() {
-    // avoid double spaces
-    if (!decoded.endsWith(" ")) {
-      decoded += " ";
-      out.value = decoded;
-    }
-  }
-
-  function classifyOnDuration(ms, unit) {
-    // dot ~ 1u, dash ~ 3u. Use threshold around 2u.
-    return (ms < unit * 2.0) ? "." : "-";
-  }
-
-  function processTransition(now, isOn, unit) {
-    const dt = now - lastSwitchTs;
-    lastSwitchTs = now;
-
-    if (lastOn && !isOn) {
-      // ON -> OFF: we just finished a dot/dash
-      const sym = classifyOnDuration(dt, unit);
-      currentSymbols += sym;
-      symbolsEl.textContent = currentSymbols;
-    } else if (!lastOn && isOn) {
-      // OFF -> ON: we just finished a gap
-      // gap handling based on dt
-      if (dt >= unit * 6.2) {       // ~7u (word gap)
-        flushLetter();
-        pushSpace();
-      } else if (dt >= unit * 2.2) { // ~3u (letter gap)
-        flushLetter();
-      } else {
-        // ~1u intra-symbol gap -> do nothing
-      }
-    }
-    lastOn = isOn;
-    stateEl.textContent = isOn ? "ON" : "OFF";
-  }
-
-  function computeROILuminance() {
-    // draw current video frame to an offscreen canvas-like path:
-    // We'll use overlay ctx temporarily with drawImage into a small buffer region via getImageData on overlay.
-    // Trick: draw video to overlay (in memory), read ROI, then redraw overlay UI after.
-    const w = overlay.width, h = overlay.height;
-    if (!w || !h) return 0;
-
-    // draw video frame mirrored to match the displayed mirrored video
+    // Pintamos frame en canvas (espejado como el vídeo)
     ctx.save();
-    ctx.setTransform(-1, 0, 0, 1, w, 0); // mirror X
+    ctx.setTransform(-1,0,0,1,w,0);
     ctx.drawImage(video, 0, 0, w, h);
     ctx.restore();
 
-    const rx = Math.floor(roi.x * w);
-    const ry = Math.floor(roi.y * h);
-    const rw = Math.floor(roi.w * w);
-    const rh = Math.floor(roi.h * h);
+    const rx = Math.floor(roi.x*w), ry = Math.floor(roi.y*h);
+    const rw = Math.max(1, Math.floor(roi.w*w)), rh = Math.max(1, Math.floor(roi.h*h));
 
-    const img = ctx.getImageData(rx, ry, rw, rh).data;
+    const data = ctx.getImageData(rx, ry, rw, rh).data;
 
-    // mean luminance (fast)
+    // muestreo rápido
     let sum = 0;
-    // sample every N pixels for speed
-    const step = 16; // 4 channels * 4 pixels
-    for (let i = 0; i < img.length; i += step) {
-      const r = img[i], g = img[i+1], b = img[i+2];
-      // Rec. 709
+    const step = 16;
+    for (let i=0; i<data.length; i+=step) {
+      const r=data[i], g=data[i+1], b=data[i+2];
       sum += 0.2126*r + 0.7152*g + 0.0722*b;
     }
-    const samples = Math.max(1, Math.floor(img.length / step));
-    const mean = sum / samples / 255; // 0..1
+    const n = Math.max(1, Math.floor(data.length/step));
+    const lum = (sum/n)/255;
 
-    // after reading, restore overlay UI
-    drawOverlay();
-    return mean;
+    // volvemos a dibujar SOLO el ROI (sin dejar el frame pintado)
+    drawROI();
+    return lum;
   }
 
-  function tick(ts) {
-    if (!listening) return;
+  // Decodificación
+  let baseline = 0, smooth = 0;
+  let lastOn = false;
+  let lastSwitch = performance.now();
+  let current = "";   // ".-"
+  let text = "";
 
-    if (!lastFrameTs) lastFrameTs = ts;
-    const dt = ts - lastFrameTs;
-    lastFrameTs = ts;
+  function flushLetter() {
+    if (!current) return;
+    const ch = MORSE[current] ?? "�";
+    text += ch;
+    out.textContent = text;
+    current = "";
+  }
+  function addSpace() {
+    if (!text.endsWith(" ")) {
+      text += " ";
+      out.textContent = text;
+    }
+  }
 
-    const lum = computeROILuminance();
+  function classifyOn(ms) {
+    return (ms < UNIT_MS * 2.0) ? "." : "-"; // <2u punto, >=2u raya
+  }
 
-    // Smooth and baseline
-    // baseline follows slowly, smooth follows faster
-    const aBaseline = 0.02;
-    const aSmooth = 0.20;
-    baseline = baseline + aBaseline * (lum - baseline);
-    smooth = smooth + aSmooth * (lum - smooth);
+  function transition(now, isOn) {
+    const dt = now - lastSwitch;
+    lastSwitch = now;
 
-    // sensitivity: higher => easier to trigger ON
-    const s = Number(sens.value); // 0..100
-    sensVal.textContent = String(s);
+    if (lastOn && !isOn) {
+      // fin de símbolo
+      current += classifyOn(dt);
+    } else if (!lastOn && isOn) {
+      // fin de gap
+      if (dt >= UNIT_MS * 6.2) {      // ~7u palabra
+        flushLetter();
+        addSpace();
+      } else if (dt >= UNIT_MS * 2.2) { // ~3u letra
+        flushLetter();
+      }
+    }
+    lastOn = isOn;
+  }
 
-    // dynamic thresholds around baseline
-    // delta needed grows when sensitivity is low
-    const delta = (1.0 - s/100) * 0.10 + 0.02; // ~0.02..0.12
+  function tick() {
+    const lum = roiLuminance();
+
+    // filtros
+    baseline = baseline + 0.02 * (lum - baseline);
+    smooth   = smooth   + 0.20 * (lum - smooth);
+
+    // umbral dinámico simple con histéresis
+    const delta = 0.05;                 // sensibilidad fija (simple)
     const onTh  = baseline + delta;
-    const offTh = baseline + delta * 0.6; // hysteresis
+    const offTh = baseline + delta*0.6;
 
     const isOn = lastOn ? (smooth > offTh) : (smooth > onTh);
 
-    // UI meter
-    luxEl.textContent = smooth.toFixed(3);
-    barFill.style.width = (clamp(smooth,0,1)*100).toFixed(1) + "%";
-
-    const unit = Number(unitSel.value);
-
-    // transition detect
     if (isOn !== lastOn) {
-      processTransition(performance.now(), isOn, unit);
-    } else {
-      // if we are OFF, check if a long silence means end of letter/word even without new ON
-      if (!isOn) {
-        const gap = performance.now() - lastSwitchTs;
-        if (currentSymbols && gap >= unit * 2.8) { // close to letter gap
-          // flush once, then wait; avoid repeated flush
-          flushLetter();
-          lastSwitchTs = performance.now();
-        }
-        if (gap >= unit * 7.5) {
-          pushSpace();
-          lastSwitchTs = performance.now();
-        }
+      transition(performance.now(), isOn);
+    } else if (!isOn && current) {
+      // si se queda en silencio suficiente, cerramos letra
+      const gap = performance.now() - lastSwitch;
+      if (gap >= UNIT_MS * 2.8) {
+        flushLetter();
+        lastSwitch = performance.now();
+      }
+      if (gap >= UNIT_MS * 7.5) {
+        addSpace();
+        lastSwitch = performance.now();
       }
     }
 
     requestAnimationFrame(tick);
   }
 
-  // --- Camera setup ---
-  let stream = null;
-
-  async function startCamera() {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: "environment", // móvil: cámara trasera
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
-      },
+  async function start() {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment", width:{ideal:1280}, height:{ideal:720} },
       audio: false
     });
     video.srcObject = stream;
-
-    await new Promise(res => video.onloadedmetadata = res);
+    await new Promise(r => video.onloadedmetadata = r);
     video.play();
 
-    overlaySizeToVideo();
-    drawOverlay();
+    syncCanvas();
+    drawROI();
 
-    btnListen.disabled = false;
-    btnClear.disabled = false;
+    requestAnimationFrame(tick);
   }
 
-  function stopCamera() {
-    if (stream) {
-      stream.getTracks().forEach(t => t.stop());
-      stream = null;
-    }
-    video.srcObject = null;
-  }
+  window.addEventListener("resize", () => { syncCanvas(); drawROI(); });
 
-  // --- Events ---
-  btnStart.addEventListener("click", async () => {
-    try {
-      btnStart.disabled = true;
-      btnStart.textContent = "Cámara activa";
-      await startCamera();
-    } catch (e) {
-      console.error(e);
-      btnStart.disabled = false;
-      btnStart.textContent = "Iniciar cámara";
-      alert("No se pudo acceder a la cámara. Abre esto en https o localhost y acepta permisos.");
-    }
-  });
-
-  btnListen.addEventListener("click", () => {
-    listening = !listening;
-    btnListen.textContent = listening ? "Parar" : "Escuchar Morse";
-    if (listening) {
-      // reset tracking
-      baseline = 0;
-      smooth = 0;
-      lastFrameTs = 0;
-      resetDecoder();
-      requestAnimationFrame(tick);
-    }
-  });
-
-  btnClear.addEventListener("click", () => {
-    decoded = "";
-    out.value = "";
-    resetDecoder();
-  });
-
-  // keep overlay in sync on resize
-  window.addEventListener("resize", () => {
-    if (!video.srcObject) return;
-    overlaySizeToVideo();
-    drawOverlay();
+  // Arranque inmediato
+  start().catch(() => {
+    out.textContent = "No se pudo acceder a la cámara (usa https o localhost).";
   });
 })();
 </script>
