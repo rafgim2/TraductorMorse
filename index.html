@@ -7,7 +7,11 @@
 <style>
   body{margin:0;background:#000;overflow:hidden}
   video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
-  canvas{position:fixed;inset:0}
+  canvas{
+    position:fixed;
+    inset:0;
+    touch-action:none; /* ← CLAVE para drag en móvil */
+  }
   #out{
     position:fixed;left:12px;right:12px;bottom:12px;
     padding:10px 12px;
@@ -22,17 +26,14 @@
 <body>
 
 <video id="v" autoplay playsinline muted></video>
-<canvas id="cv"></canvas>
 <canvas id="ui"></canvas>
 <div id="out"></div>
 
 <script>
 (() => {
 
-const UNIT = 250;          // EXACTO como el emisor
-const ROI_SIZE = 20;       // pequeño y cuadrado
-const TOL = 0.45;          // tolerancia amplia
-
+const UNIT = 250;
+const ROI = 24; // cuadrado pequeño
 const MORSE = {
 ".-":"A","-...":"B","-.-.":"C","-..":"D",".":"E","..-.":"F",
 "--.":"G","....":"H","..":"I",".---":"J","-.-":"K",".-..":"L",
@@ -44,26 +45,28 @@ const MORSE = {
 };
 
 const v = document.getElementById("v");
-const cv = document.getElementById("cv");
 const ui = document.getElementById("ui");
-const ctxV = cv.getContext("2d",{willReadFrequently:true});
-const ctxU = ui.getContext("2d");
+const ctx = ui.getContext("2d");
 const out = document.getElementById("out");
 
+/* Canvas de lectura fuera de pantalla */
+const cv = document.createElement("canvas");
+const ctxV = cv.getContext("2d",{willReadFrequently:true});
+
 function resize(){
-  cv.width = ui.width = innerWidth;
-  cv.height = ui.height = innerHeight;
+  ui.width = cv.width = innerWidth;
+  ui.height = cv.height = innerHeight;
 }
 addEventListener("resize", resize);
 resize();
 
-/* ROI EN CSS PIXELS */
-let roi = { x: 60, y: 60 };
+/* ROI en CSS pixels */
+let roi = { x: 80, y: 80 };
 let drag=false, dx=0, dy=0;
 
 ui.addEventListener("pointerdown", e=>{
-  if(e.clientX>=roi.x && e.clientX<=roi.x+ROI_SIZE &&
-     e.clientY>=roi.y && e.clientY<=roi.y+ROI_SIZE){
+  if(e.clientX>=roi.x && e.clientX<=roi.x+ROI &&
+     e.clientY>=roi.y && e.clientY<=roi.y+ROI){
     drag=true;
     dx=e.clientX-roi.x;
     dy=e.clientY-roi.y;
@@ -78,21 +81,20 @@ ui.addEventListener("pointermove", e=>{
 ui.addEventListener("pointerup", ()=>drag=false);
 ui.addEventListener("pointercancel", ()=>drag=false);
 
-/* LEE UN SOLO PIXEL CENTRAL */
+/* LEE PIXEL CENTRAL – SINCRONIZADO */
 function readPixel(){
   ctxV.drawImage(v,0,0,cv.width,cv.height);
-  const cx = Math.floor(roi.x + ROI_SIZE/2);
-  const cy = Math.floor(roi.y + ROI_SIZE/2);
-  const d = ctxV.getImageData(cx,cy,1,1).data;
-  return 0.2126*d[0]+0.7152*d[1]+0.0722*d[2];
+  const x = Math.floor(roi.x + ROI/2);
+  const y = Math.floor(roi.y + ROI/2);
+  const d = ctxV.getImageData(x,y,1,1).data;
+  return 0.2126*d[0] + 0.7152*d[1] + 0.0722*d[2];
 }
 
 /* DECODER */
 let lastOn=false;
 let lastT=performance.now();
-let current="";
-let text="";
 let ref=null;
+let current="", text="";
 
 function flush(){
   if(current){
@@ -102,12 +104,11 @@ function flush(){
   }
 }
 
-function loop(){
+function processFrame(){
   const lum = readPixel();
-
   if(ref===null) ref=lum;
-  const on = lum > ref + 20; // diferencia clara
 
+  const on = lum > ref + 15; // umbral simple y robusto
   const now = performance.now();
 
   if(on!==lastOn){
@@ -115,36 +116,51 @@ function loop(){
     lastT=now;
 
     if(lastOn && !on){
-      current += (dt < UNIT*(1+TOL)) ? "." : "-";
+      current += dt < 2*UNIT ? "." : "-";
     }
 
     if(!lastOn && on){
-      if(dt > UNIT*6*(1-TOL)){
-        flush();
-        text+=" ";
-        out.textContent=text;
-      } else if(dt > UNIT*2*(1-TOL)){
-        flush();
-      }
+      if(dt >= 7*UNIT){ flush(); text+=" "; }
+      else if(dt >= 3*UNIT){ flush(); }
+      out.textContent=text;
     }
 
     lastOn=on;
-    ref=lum; // actualizar referencia
+    ref=lum;
   }
 
-  ctxU.clearRect(0,0,ui.width,ui.height);
-  ctxU.strokeStyle="rgba(0,255,120,.9)";
-  ctxU.lineWidth=2;
-  ctxU.strokeRect(roi.x,roi.y,ROI_SIZE,ROI_SIZE);
+  ctx.clearRect(0,0,ui.width,ui.height);
+  ctx.strokeStyle="rgba(0,255,120,.9)";
+  ctx.lineWidth=2;
+  ctx.strokeRect(roi.x,roi.y,ROI,ROI);
+}
 
-  requestAnimationFrame(loop);
+/* LOOP sincronizado al vídeo */
+function startLoop(){
+  if ("requestVideoFrameCallback" in HTMLVideoElement.prototype){
+    const step = () => {
+      processFrame();
+      v.requestVideoFrameCallback(step);
+    };
+    v.requestVideoFrameCallback(step);
+  } else {
+    const step = () => {
+      processFrame();
+      requestAnimationFrame(step);
+    };
+    step();
+  }
 }
 
 navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})
 .then(s=>{
   v.srcObject=s;
-  v.onloadedmetadata=()=>{v.play();loop();}
-});
+  v.onloadedmetadata=()=>{
+    v.play();
+    startLoop();
+  };
+})
+.catch(()=>out.textContent="No se pudo acceder a la cámara");
 
 })();
 </script>
